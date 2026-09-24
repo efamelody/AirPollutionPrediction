@@ -1,0 +1,6 @@
+streamlit==1.39.0
+numpy==1.26.4
+pandas==2.2.3
+requests==2.32.3
+pydeck==0.9.1
+scipy==1.14.1
