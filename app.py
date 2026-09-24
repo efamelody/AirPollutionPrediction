@@ -142,8 +142,11 @@ if not override_meteo:
 else:
     meteo_data = cached_meteo(METEO_LAT, METEO_LON, True, meteo_data["wind_speed"], meteo_data["wind_dir"], meteo_data["precipitation"])
 
+use_live_air = st.sidebar.checkbox("Use live air quality (Open-Meteo CAMS)", value=True, help="When ON: city 'Measured now' is real current PM2.5 from Open-Meteo (matches DOE moderate values like 40-70). When OFF: shows mock haze-event (KL 85, Kuching 112) to demo a heavy haze day. Predicted is always only the *fire smoke* part.")
+receptors_df = fetch_malaysia_receptors(live=use_live_air)
+if not receptors_df.empty and "pm25_source" in receptors_df.columns:
+    st.sidebar.caption(f"City air source: {receptors_df['pm25_source'].iloc[0]}")
 hotspots_raw = cached_hotspots(firms_api_key, selected_days)
-receptors_df = fetch_malaysia_receptors()
 
 with st.spinner("Checking which fires match the pollution in cities..."):
     hotspots_analyzed = run_bayesian_inversion(hotspots_raw, receptors_df, meteo_data, sigma_obs=sigma_obs)
@@ -175,36 +178,49 @@ with k3:
 # CITY CARDS — prediction vs truth, plain language
 # ------------------------------------------------------------------------------
 st.markdown("## 🏙️ Will it be hazy? — City by city")
-st.caption("Each card = one Malaysian city. **Left number = our prediction for the next hours.** Right small grey = what was actually measured now (ground truth). If they match, the model is doing well.")
+st.caption("**Top = what we predict is coming from Indonesian fires** (smoke carried by wind, washed by rain). **Bottom grey = what is actually measured right now** (all sources: fires + traffic + factories — this is what DOE reports). They can differ when wind blows smoke away or when local pollution is high.")
+# Global mismatch banner
+mismatch = 0
+if not city_forecast.empty:
+    for _, r in city_forecast.iterrows():
+        if abs(pm25_to_api(float(r["pm25_obs"])) - int(r["api_pred"])) >= 50:
+            mismatch += 1
+if mismatch >= 2:
+    st.warning(f"⚠️ Predicted haze (fire smoke) is much lower than measured air in {mismatch} cities. That means today's air is dominated by **local city pollution**, not Indonesian smoke — wind is blowing smoke away (check Evidence tab wind arrows). The forecast is for *fire smoke only*, not total city pollution. Toggle to heavy smoke + SW wind (225°) in the sidebar to see a transboundary haze event.")
+elif mismatch >= 1:
+    st.info("ℹ️ Small mismatch: predicted fire smoke vs measured total air. See Evidence tab for wind direction — if it points away from Malaysia, fires aren't the cause today.")
+
 cols = st.columns(len(city_forecast))
 for col, (_, row) in zip(cols, city_forecast.iterrows()):
     api = int(row["api_pred"])
     cat, color = api_category(api)
     obs = float(row["pm25_obs"])
     obs_api = pm25_to_api(obs)
-    obs_cat, _ = api_category(obs_api)
-    # plain advice
-    if api >= 201:
-        advice = "🔴 Stay indoors, close windows"
-        face = "😷"
-    elif api >= 101:
-        advice = "🟠 Limit outdoor activity"
-        face = "😶‍🌫️"
-    elif api >= 51:
-        advice = "🟡 Sensitive people take care"
-        face = "🙂"
-    else:
-        advice = "🟢 Air is good — no worry"
-        face = "😊"
+    obs_cat, obs_color = api_category(obs_api)
+    # Advice for predicted (fire smoke)
+    if api >= 201: pred_advice, pred_face = "🔴 Fire smoke: Stay indoors", "😷"
+    elif api >= 101: pred_advice, pred_face = "🟠 Fire smoke: Limit outdoor", "😶‍🌫️"
+    elif api >= 51: pred_advice, pred_face = "🟡 Some fire haze", "🙂"
+    else: pred_advice, pred_face = "🟢 No fire haze coming", "😊"
+    # Advice for measured (actual air you breathe — what DOE reports)
+    if obs_api >= 201: meas_advice = "🔴 Actually: Hazardous — stay indoors"
+    elif obs_api >= 101: meas_advice = "🟠 Actually: Unhealthy — limit outdoor"
+    elif obs_api >= 51: meas_advice = "🟡 Actually: Moderate — sensitive groups care"
+    else: meas_advice = "🟢 Actually: Good air now"
     with col:
         st.markdown(f"""
 <div style="padding:12px;border-radius:12px;border:2px solid {color};background:#0f1117;text-align:center;">
   <div style="font-weight:700;font-size:15px;">{row['station_name']}</div>
-  <div style="font-size:28px;margin:4px 0;">{face}</div>
-  <div style="font-size:22px;font-weight:800;color:{color};">API {api} — {cat}</div>
-  <div style="font-size:12px;color:#ccc;">Predicted PM2.5 {row['pm25_pred']:.1f} µg/m³</div>
-  <div style="font-size:11px;color:#888;margin-top:6px;border-top:1px solid #2a2a3a;padding-top:6px;">Measured now: {obs:.1f} µg/m³ → API {obs_api} {obs_cat}</div>
-  <div style="font-size:11px;color:{color};margin-top:4px;font-weight:600;">{advice}</div>
+  <div style="font-size:26px;margin:4px 0;">{pred_face}</div>
+  <div style="font-size:11px;color:#888;letter-spacing:0.5px;">PREDICTED (fire smoke only)</div>
+  <div style="font-size:20px;font-weight:800;color:{color};">API {api} — {cat}</div>
+  <div style="font-size:11px;color:#ccc;">Smoke PM2.5 {row['pm25_pred']:.1f} µg/m³</div>
+  <div style="font-size:11px;color:{color};margin-top:4px;font-weight:600;">{pred_advice}</div>
+  <div style="margin-top:8px;padding-top:8px;border-top:1px solid #2a2a3a;">
+    <div style="font-size:11px;color:#888;">MEASURED NOW (all sources — DOE-like)</div>
+    <div style="font-size:14px;font-weight:700;color:{obs_color};">API {obs_api} — {obs_cat} <span style="font-weight:400;color:#aaa;">({obs:.1f} µg/m³)</span></div>
+    <div style="font-size:11px;color:{obs_color};margin-top:2px;">{meas_advice}</div>
+  </div>
 </div>
         """, unsafe_allow_html=True)
 

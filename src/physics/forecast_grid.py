@@ -47,8 +47,6 @@ def build_haze_grid(
     pr = float(meteo.get("precipitation", 0.5))
 
     def _long_range_heuristic(slat, slon, tlat, tlon, frp, ws, wd, pr, weight):
-        # Empirical transboundary-range plume: visible to ~600km, crosswind spread ~0.18*x
-        # Keeps wind alignment + rain scavenging but uses calibrated decay, not full Gaussian dilution
         R = EARTH_RADIUS_M
         dlat = np.radians(tlat - slat)
         dlon = np.radians(tlon - slon)
@@ -61,19 +59,14 @@ def build_haze_grid(
         if x_down <= 0:
             return 0.0
         x_down = max(x_down, 1000.0)
-        # Along-wind exponential decay length ~260km (tuned to Sumatra->KL visible)
-        L = 260_000.0
+        L = 380_000.0
         along = np.exp(-x_down / L)
-        # Crosswind Gaussian with width 0.18*x (broader at distance)
-        sigma_cross = 0.18 * x_down + 8000.0
+        sigma_cross = 0.42 * x_down + 18000.0
         cross = np.exp(-0.5 * (y_cross / sigma_cross) ** 2)
-        # Rain scavenging over transport time
         Lambda = SCAVENGE_A * (pr ** SCAVENGE_B) if pr > 0 else 0.0
         scav = float(np.exp(-Lambda * (x_down / max(ws, 0.5))))
-        # Wind speed dilution (higher wind = more dilute at source but faster transport)
         wind_factor = 3.5 / max(ws, 1.0)
-        # Scale: frp ~100 MW -> ~35 ug/m3 at 250km downwind centreline before rain/wind
-        base = float(frp) * 2.8 * along * cross * scav * wind_factor * float(weight)
+        base = float(frp) * 3.2 * along * cross * scav * wind_factor * float(weight)
         return float(np.clip(base, 0, 400))
 
     rows = []
@@ -128,14 +121,14 @@ def predict_for_receptors(
         if x_down <= 0:
             return 0.0
         x_down = max(x_down, 1000.0)
-        L = 260_000.0
+        L = 380_000.0
         along = np.exp(-x_down / L)
-        sigma_cross = 0.18 * x_down + 8000.0
+        sigma_cross = 0.42 * x_down + 18000.0
         cross = np.exp(-0.5 * (y_cross / sigma_cross) ** 2)
         Lambda = SCAVENGE_A * (pr ** SCAVENGE_B) if pr > 0 else 0.0
         scav = float(np.exp(-Lambda * (x_down / max(ws, 0.5))))
         wind_factor = 3.5 / max(ws, 1.0)
-        base = float(frp) * 2.8 * along * cross * scav * wind_factor * float(weight)
+        base = float(frp) * 3.2 * along * cross * scav * wind_factor * float(weight)
         return float(np.clip(base, 0, 400))
 
     rows = []
