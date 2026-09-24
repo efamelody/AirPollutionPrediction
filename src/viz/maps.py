@@ -24,40 +24,54 @@ def build_deck(
 ) -> pdk.Deck:
     layers = []
 
-    # 1. Haze heatmap (bottom layer)
+    # 1. Haze field — smooth plume layer (no HeatmapLayer striping)
+    # Shows only plume excess above background so uniform 8 µg background does not paint the whole map
     if show_haze and haze_grid is not None and not haze_grid.empty:
         hg = haze_grid.copy()
         hg["color"] = hg["pm25"].apply(_haze_color)
-        # Heatmap for smooth appearance + column for precise cells
-        layers.append(
-            pdk.Layer(
-                "HeatmapLayer",
-                data=hg,
-                get_position=["lon", "lat"],
-                get_weight="pm25",
-                radius_pixels=28,
-                intensity=1.2,
-                threshold=0.05,
-                aggregation="MEAN",
-                color_range=[[0, 176, 80], [255, 235, 59], [255, 152, 0], [244, 67, 54], [139, 0, 0], [80, 0, 0]],
+        # Excess over background drives visibility; hides the 8 µg clean-air baseline
+        bg = float(hg["pm25"].min()) if len(hg) else 8.0
+        hg["excess"] = (hg["pm25"] - bg).clip(lower=0)
+        # Drop near-zero cells to avoid painting uniform background as haze
+        hg_plot = hg[hg["excess"] > 0.8].copy()
+        if not hg_plot.empty:
+            # Soften and merge: Scatterplot with overlapping radii blends into a continuous plume
+            # Radius ~30km merges the 37×98km grid without striping
+            hg_plot["radius_m"] = 30000
+            layers.append(
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    data=hg_plot,
+                    get_position=["lon", "lat"],
+                    get_color="color",
+                    get_radius="radius_m",
+                    radius_min_pixels=8,
+                    radius_max_pixels=55,
+                    stroked=False,
+                    filled=True,
+                    pickable=True,
+                    opacity=0.62,
+                    auto_highlight=True,
+                )
             )
-        )
-        layers.append(
-            pdk.Layer(
-                "ColumnLayer",
-                data=hg,
-                get_position=["lon", "lat"],
-                get_elevation="pm25 * 18",
-                elevation_scale=1,
-                radius=9000,
-                get_fill_color="color",
-                get_line_color=[40, 40, 40, 80],
-                line_width_min_pixels=1,
-                stroked=True,
-                pickable=True,
-                auto_highlight=True,
-            )
-        )
+            # Subtle 3D columns only for high-excess cells (avoids grid of tiny columns)
+            hg_high = hg_plot[hg_plot["excess"] > 5].copy()
+            if not hg_high.empty:
+                layers.append(
+                    pdk.Layer(
+                        "ColumnLayer",
+                        data=hg_high,
+                        get_position=["lon", "lat"],
+                        get_elevation="excess * 1800",
+                        elevation_scale=1,
+                        radius=11000,
+                        get_fill_color="color",
+                        get_line_color=[30, 30, 30, 90],
+                        line_width_min_pixels=1,
+                        stroked=True,
+                        pickable=True,
+                    )
+                )
 
     # 2. Rain overlay (translucent circles where precip > threshold)
     if show_rain and meteo_grid is not None and not meteo_grid.empty:
@@ -162,7 +176,7 @@ def build_deck(
             )
         )
 
-    view_state = pdk.ViewState(latitude=3.8, longitude=108.0, zoom=5.1, pitch=44, bearing=-4)
+    view_state = pdk.ViewState(latitude=3.2, longitude=106.5, zoom=5.4, pitch=38, bearing=0)
 
     tooltip = {
         "html": "<b>Haze</b> {pm25} µg/m³ API {api} {category}<br/><b>Hotspot</b> FRP {frp} posterior {posterior_prob}<br/><b>Wind</b> {wind_speed} m/s {wind_dir}° <b>Rain</b> {precip} mm/h",
