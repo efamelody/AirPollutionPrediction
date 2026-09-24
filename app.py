@@ -187,7 +187,7 @@ col_map, col_stats = st.columns([2.3, 1])
 
 with col_map:
     st.subheader("Map — Haze, Wind, Rain")
-    st.caption("Heatmap = predicted PM2.5 (haze). Height = pollution amount. Orange circles = fires (bigger = stronger FRP, redder = more likely source). Arrows = wind blowing toward Malaysia. Blue dots = rain washing haze away.")
+    st.caption("Use the legend below to read the map. Toggle layers in the sidebar.")
     try:
         deck = build_deck(
             hotspots_analyzed,
@@ -200,11 +200,56 @@ with col_map:
             show_receptors=show_receptors,
         )
         st.pydeck_chart(deck, use_container_width=True)
-        # Legend
+        # ——— COMPREHENSIVE LEGEND ———
         st.markdown(
-            "<span style='color:#00b050'>■ Good (0-50)</span> &nbsp; <span style='color:#ffeb3b'>■ Moderate (51-100)</span> &nbsp; "
-            "<span style='color:#ff9800'>■ Unhealthy (101-200)</span> &nbsp; <span style='color:#f44336'>■ Very Unhealthy (201-300)</span> &nbsp; "
-            "<span style='color:#8b0000'>■ Hazardous (301+)</span>",
+            """
+<div style="background:#0f1117;border:1px solid #2a2a3a;border-radius:10px;padding:14px 16px;margin-top:10px;font-size:13px;line-height:1.5;">
+  <div style="font-weight:700;font-size:14px;margin-bottom:8px;letter-spacing:0.3px;">🗺️ Map Legend — what each symbol means</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px 18px;">
+    <div>
+      <div style="font-weight:600;margin-bottom:4px;">🔥 Fires (NASA FIRMS hotspots)</div>
+      <div><span style="display:inline-block;width:14px;height:14px;border-radius:50%;background:#ff3b30;border:2px solid white;vertical-align:middle;margin-right:6px;"></span><b>Red/orange circles</b> = active fires in Indonesia</div>
+      <div style="margin-left:22px;color:#aaa;">• <b>Size</b> = Fire Radiative Power (FRP) — bigger = stronger burn, more smoke (Q = 0.02×FRP)</div>
+      <div style="margin-left:22px;color:#aaa;">• <b>Colour</b> = Bayesian posterior — redder = more likely the source of Malaysia's haze (back-calculated from wind + city PM2.5)</div>
+      <div style="margin-left:22px;color:#aaa;">• White outline = hotspot location (Sumatra / Kalimantan)</div>
+    </div>
+    <div>
+      <div style="font-weight:600;margin-bottom:4px;">🏙️ City towers (Malaysian receptors)</div>
+      <div><span style="display:inline-block;width:12px;height:18px;background:#ff9800;border:1px solid white;vertical-align:middle;margin-right:6px;"></span><b>3D columns</b> over KL, JB, Kuching, Ipoh, KB</div>
+      <div style="margin-left:22px;color:#aaa;">• <b>Height</b> = pollution amount (PM2.5 µg/m³ or API — see sidebar toggle)</div>
+      <div style="margin-left:22px;color:#aaa;">• <b>Colour</b> = Malaysian API category (see haze scale below)</div>
+      <div style="margin-left:22px;color:#aaa;">• Click a tower for forecast vs observed values</div>
+    </div>
+    <div>
+      <div style="font-weight:600;margin-bottom:4px;">🌫️ Haze plume (forecast)</div>
+      <div><span style="display:inline-block;width:14px;height:14px;border-radius:50%;background:#ff9800;opacity:0.7;vertical-align:middle;margin-right:6px;"></span><b>Soft coloured blobs</b> = predicted smoke downwind</div>
+      <div style="margin-left:22px;color:#aaa;">• Colour = predicted PM2.5 → API (green→yellow→orange→red, same scale as cities)</div>
+      <div style="margin-left:22px;color:#aaa;">• Covers only <b>excess above background</b> (background 8 µg hidden), with faint 3D columns where haze &gt;5 µg — this is why the old stripes are gone</div>
+      <div style="margin-left:22px;color:#aaa;">• Toggle <b>Show haze heatmap</b> in sidebar to hide/show</div>
+    </div>
+    <div>
+      <div style="font-weight:600;margin-bottom:4px;">💨 Wind &amp; 🌧️ Rain</div>
+      <div><span style="display:inline-block;width:18px;height:3px;background:#c8c8d2;vertical-align:middle;margin-right:6px;"></span><b>Grey arrows</b> = wind vectors (Open-Meteo)</div>
+      <div style="margin-left:22px;color:#aaa;">• Direction = where smoke is <b>blowing to</b>; length = speed (m/s). FROM convention: 225° = SW monsoon → blows NE toward Malaysia</div>
+      <div style="margin-top:6px;"><span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#1e90ff;opacity:0.7;vertical-align:middle;margin-right:6px;"></span><b>Blue dots</b> = rain (precip mm/h)</div>
+      <div style="margin-left:22px;color:#aaa;">• Bigger/bluer = heavier rain = stronger scavenging (Λ = 1e-4·P<sup>0.8</sup>) washing haze out</div>
+      <div style="margin-left:22px;color:#aaa;">• Toggle <b>Show wind / Show rain</b> in sidebar</div>
+    </div>
+  </div>
+  <div style="margin-top:12px;padding-top:10px;border-top:1px solid #2a2a3a;">
+    <div style="font-weight:600;margin-bottom:6px;">📊 Malaysian API (Air Pollutant Index) — haze severity scale</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+      <span style="background:#00b050;color:white;padding:3px 8px;border-radius:4px;font-weight:600;">■ Good 0–50</span>
+      <span style="background:#ffeb3b;color:#1a1a1a;padding:3px 8px;border-radius:4px;font-weight:600;">■ Moderate 51–100</span>
+      <span style="background:#ff9800;color:white;padding:3px 8px;border-radius:4px;font-weight:600;">■ Unhealthy 101–200</span>
+      <span style="background:#f44336;color:white;padding:3px 8px;border-radius:4px;font-weight:600;">■ Very Unhealthy 201–300</span>
+      <span style="background:#8b0000;color:white;padding:3px 8px;border-radius:4px;font-weight:600;">■ Hazardous 301+</span>
+    </div>
+    <div style="color:#aaa;margin-top:6px;">API is computed from predicted PM2.5 via DOE breakpoints. <b>API ≥100 = haze alert</b> (limit outdoor activity).</div>
+  </div>
+  <div style="margin-top:10px;color:#888;font-size:12px;">💡 Tip: Change <b>Wind FROM</b> to 90° (easterly) and haze blows away from Malaysia. Increase <b>Rain</b> to 10 mm/h and the plume fades (scavenging). Use <b>Haze amplification</b> to scale visual intensity (pattern is real, absolute numbers are illustrative until calibrated).</div>
+</div>
+            """,
             unsafe_allow_html=True,
         )
     except Exception as e:
