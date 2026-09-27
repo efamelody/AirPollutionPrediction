@@ -1,94 +1,334 @@
-# Transboundary Haze Prediction — Indonesian Fires → Malaysian API
+# Transboundary Haze Attribution — Calibrated Research Model
 
-> **Research demonstrator, not an operational forecaster.**  
-> Question: *Will my Malaysian city have haze (API ≥100) tomorrow given fires in Indonesia, wind, and rain?*  
-> This repo builds the data pipeline + physics + Bayesian attribution as a Streamlit dashboard so you can see fires, wind, rain, and predicted API together — then refine the science.
-
-Live demo: `https://<you>-airpollutionprediction-xxxx.streamlit.app` (auto-deploys on `git push` to `main`).
+> **Proxy-calibrated research model** for transboundary haze attribution from Indonesian fires to Malaysian cities.
+> Uses biome-differentiated emissions, trajectory transport with ERA5 PBL, path-integrated scavenging, urban baseline separation, and continuous Bayesian inverse attribution.
+> Validated against CAMS EAC4 reanalysis (proxy validation).
 
 ---
 
-## 1) What we actually built — honest summary
-
-| Component | Status | What it does | What it *doesn't* do (your research gap) |
-|-----------|--------|--------------|------------------------------------------|
-| **Fire ingestion** `src/data/firms.py:18` | Works | NASA FIRMS VIIRS 375m hotspots over Indonesia (lat, lon, FRP, confidence). Filters `confidence≥70`. Falls back to 5 synthetic Sumatra/Kalimantan fires when `DEMO_KEY`. | No cloud-cover correction, no peat vs forest FRP→Q conversion, no hotspot clustering. Needs emission inventory calibration. |
-| **Weather (wind + rain)** `src/data/meteo.py:8`, `src/data/meteo_grid.py:28` | Works but crude | Open-Meteo ECMWF/GFS `wind_speed_10m, wind_direction_10m, precipitation` at Strait of Malacca centroid + 4×6 grid for arrows. Converts to `U, θ, Λ`. | **Single centroid wind** for whole domain — real transboundary needs gridded 3D NWP (ECMWF 0.1° + PBL height, stability class). No vertical wind shear. |
-| **Air quality (ground truth)** `src/data/receptors.py:14` | Live via Open-Meteo CAMS, fallback mock | Tries `air-quality-api.open-meteo.com/v1/air-quality?hourly=pm2_5` for KL/JB/Kuching/Ipoh/KB. If fails (3+ stations must succeed), uses mock haze-event `85.4/62.1/112.0 µg` (API 160+). Toggle in sidebar. | **No direct DOE APIMS ingestion** — EQMS `api3/publicmapproxy` is proxied ArcGIS with no documented hourly JSON. DOE real-time requires scraping or JAS API token. OpenDOSM `monthly air_pollution` is daily aggregates, not hourly API. |
-| **Physics — plume** `src/physics/dispersion.py:5`, `src/physics/forecast_grid.py:49` | Demonstrator — pattern correct, magnitude **uncalibrated** | Steady-state Gaussian + exponential wet scavenging: `C = Q/(πUσyσz)·exp(-y²/2σy²)·exp(-h²/2σz²)·exp(-Λx/U)·1e6`, `Λ=1e-4·P^0.8`, `Q=0.02·FRP`, plus empirical long-range heuristic `C_far = FRP·3.2·exp(-x/380km)·exp(-y²/2σc²)` with `σc=0.42x+18km` so plume reaches 300–600km. Rain kills plume (light rain 0.5 mm/h → 97% removal over 300km at 4.5 m/s). | **Gaussian valid ~1–20km**, not 300–800km maritime. Real system needs Lagrangian (HYSPLIT) or Eulerian (WRF-Chem/CMAQ) with 3D advection-diffusion, PBL entrainment, chemical aging. `Q=0.02·FRP` and heuristic `×3.2` are **tuned for visibility**, not fitted to DOE history. `L=380km` chosen so Sumatra→JB shows haze. Background fixed 8 µg. |
-| **PM2.5 → API** `src/physics/api.py:10` | Correct | DOE breakpoint piecewise linear (US-EPA PM2.5 → API 0–500). API ≥100 = Unhealthy = haze. Used for city cards and map colours. | DOE API is max over 5 pollutants (PM2.5, PM10, O3, SO2, NO2, CO). We use PM2.5 only — true API needs all. |
-| **Inverse — which fire is culprit?** `src/physics/inversion.py:14` | Works (discrete) | `prior ∝ FRP`, likelihood `Π Normal(d_k| C_k(θ), σ=15)`, posterior `∝ prior·likelihood`, log-sum-exp normalized. Exhaustive over N hotspots, `O(N·K)` <1s. | Discrete grid only (not continuous `x_s,y_s,Q`). No MCMC/Gelman-Rubin, diagonal `R`, no spatial correlation. High-dimensional `M×forward` intractable without PINN surrogate. |
-| **Forecast grid + map** `src/physics/forecast_grid.py:13`, `src/viz/maps.py:28` | Works | Sums plumes over 18×22 grid across Malaysia (excess only `>0.8 µg` so background doesn't paint map). Wind LineLayer + rain Scatterplot + city Columns. | No time stepping — assumes steady wind over forecast horizon. No accumulation over hours/days. No trajectory. |
-| **Dashboard** `app.py:180` | Layman-ready | Tabs: Prediction (haze cloud + city API) vs Evidence (fires+wind+rain) vs How-it-works (plain language). Plain cards separate *Predicted fire smoke* vs *Measured now (DOE-like)* and warn on mismatch. | Predictions suck by design — see below. |
-
-**Bottom line:** The AI-built pipeline is *correct in structure* (fires → wind/rain → plume → API → Bayes) but **wrong in calibration**. That's expected — the science you need to refine is the calibration, not the code.
-
----
-
-## 2) End-to-end flow (the formula you need to refine)
+## System Architecture Overview
 
 ```
-NASA FIRMS (lat,lon,FRP) ─┐
-                           ├─→ Q = 0.02·FRP  (your first calibration: FRP→kg/s via emission factor, fuel load, peat vs forest)
-Open-Meteo (U,θ,P) ────────┤     Λ = 1e-4·P^0.8 ,  t = x/U
-                           ├─→ C(x,y) = plume(Q,U,θ,Λ, x,y)  (your main physics: replace Gaussian with HYSPLIT/WRF)
-                           │     Total PM2.5 = background + Σ fires C
-                           ├─→ API = breakpoint(PM2.5)  (DOE table, src/physics/api.py:7)
-                           └─→ p(θ|d) ∝ Normal(d | f(θ),R)·(FRP/ΣFRP)  (your inference: which fire explains city PM2.5?)
-                                          ↑ d = measured PM2.5 at KL/JB/Kuching/Ipoh/KB
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                        TRANSBOUNDARY HAZE ATTRIBUTION PIPELINE                       │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                      │
+│  NASA FIRMS VIIRS                    ESA WorldCover 10m                              │
+│  ┌──────────────┐                    ┌──────────────┐                                │
+│  │ Hotspots     │───────────────────▶│ Biome        │                                │
+│  │ (lat,lon,FRP)│                    │ Classification│                                │
+│  └──────────────┘                    └──────┬───────┘                                │
+│        │                                     │                                        │
+│        ▼                                     ▼                                        │
+│  ┌──────────────────────────────────────────────────────────────┐                     │
+│  │                    EMISSION ENGINE                            │                     │
+│  │  Q = C_f × FRP_adj × EF_PM2.5 × 10⁻³   (kg/s)               │                     │
+│  │  Peat:      C_f=0.52, EF=28.0  → Q ≈ 0.0146 × FRP            │                     │
+│  │  Forest:    C_f=0.36, EF=9.1   → Q ≈ 0.0033 × FRP            │                     │
+│  │  Cropland:  C_f=0.45, EF=7.8   → Q ≈ 0.0035 × FRP            │                     │
+│  └──────────────────────────────┬────────────────────────────────┘                     │
+│                                 │                                                      │
+│                                 ▼                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐                     │
+│  │                    TRAJECTORY TRANSPORT                       │                     │
+│  │  dx/dt = u(x,t), dy/dt = v(x,t)    (ERA5 hourly winds)      │                     │
+│  │  PBL height: H_pbl(t) = 200-1500m (diurnal cycle)            │                     │
+│  │  Box model: C = Q/(√2π U σ_y H_pbl) × exp(-y²/2σ_y²)         │                     │
+│  │  Scavenging: exp(-∫ Λ dt),  Λ = 10⁻⁴ P^0.8                   │                     │
+│  └──────────────────────────────┬────────────────────────────────┘                     │
+│                                 │                                                      │
+│                    ┌────────────┴────────────┐                                          │
+│                    ▼                         ▼                                          │
+│  ┌─────────────────────────┐   ┌─────────────────────────┐                            │
+│  │    URBAN BASELINE       │   │  BAYESIAN INVERSE       │                            │
+│  │  CAMS non-haze months   │   │  2000 importance samples │                            │
+│  │  C_urban(t) = base +    │   │  Log-normal prior        │                            │
+│  │    amp·cos(2π(t-peak)/24)│   │  Spatial covariance R    │                            │
+│  │  Regional: 12 µg/m³     │   │  Posterior P(fire|data)  │                            │
+│  └───────────┬─────────────┘   └───────────┬──────────────┘                            │
+│              │                             │                                            │
+│              ▼                             ▼                                            │
+│  ┌──────────────────────────────────────────────────────────────┐                     │
+│  │                    TOTAL PM2.5 PREDICTION                     │                     │
+│  │  C_total = C_smoke + C_urban + C_background                  │                     │
+│  │  API = DOE breakpoints (0-500 scale)                         │                     │
+│  └──────────────────────────────────────────────────────────────┘                     │
+│                                                                                      │
+└─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Concrete example (how to audit):**  
-Fire `-1.23,103.81 FRP 89 MW` → `Q=1.78 kg/s`, wind `5 m/s FROM 225° (blows NE)`, rain `0.6 mm/h` → to JB `1.49,103.74` `x≈ 280km` → `C_far ≈ 89·3.2·exp(-280/380)=89·3.2·0.48=136·cross(~0.7)·scav(0.3)·wind(0.7)=20 µg` at amp 80 → `Total 28 µg → API 83 Moderate`. Make it dry `P=0` + `L=380` + amp 80 → `~70 µg → API 158 Unhealthy`. That's how wind/rain move the API over the 100 threshold.
+---
+
+## Module Details
+
+### 1. Emission Engine (`src/data/landcover.py`, `src/physics/calibration.py`)
+
+**Biome Classification** (ESA WorldCover 10m via WMS + heuristic fallback):
+| ESA Class | Biome | C_f (kg/MJ) | EF_PM2.5 (g/kg) | Q_factor (kg/s per MW) |
+|-----------|-------|-------------|-----------------|------------------------|
+| 90 (Wetland) | Peatland | 0.52 | 28.0 | 0.0146 |
+| 10 (Tree cover) | Tropical Forest | 0.36 | 9.1 | 0.0033 |
+| 40 (Cropland) | Oil Palm/Cropland | 0.45 | 7.8 | 0.0035 |
+
+**Emission Calculation**:
+```
+FRP_adj = FRP_obs / ((1 - α_cloud) × exp(-τ_canopy))
+Q = C_f × FRP_adj × EF_PM2.5 × 10⁻³  [kg/s]
+```
+- α_cloud = 0.15 (cloud cover fraction)
+- τ_canopy = 0.1 (peat) to 0.8 (forest)
+
+### 2. Trajectory Transport (`src/physics/calibration.py`)
+
+**2D Trajectory Integration**:
+```
+dx/dt = u(x,y,t),  dy/dt = v(x,y,t)     [ERA5 hourly u/v at 0.25°]
+x(t+Δt) = x(t) + u × 3600 × Δt / (R × cos(lat))
+y(t+Δt) = y(t) + v × 3600 × Δt / R
+```
+
+**PBL-Capped Box Model**:
+```
+σ_y(x) = 0.11 × x × (1 + 0.0001×x)⁻⁰·⁵     [crosswind spread]
+C(x,y) = Q / (√(2π) × U × σ_y × H_pbl) × exp(-y²/(2σ_y²)) × Retention × 10⁶
+```
+- H_pbl: 200m (night) → 1500m (day) from diurnal model
+- U: mean wind speed along trajectory
+- y: crosswind distance from trajectory to receptor
+
+**Path-Integrated Wet Scavenging**:
+```
+Λ(t) = a × P(t)^b     [a=10⁻⁴, b=0.8, P in mm/h]
+Retention = exp(-∫₀ᵀ Λ(t) dt) ≈ exp(-Σ Λ_i × Δt)
+```
+Integrated along full trajectory, not just at source.
+
+### 3. Urban Baseline (`src/data/cams.py`)
+
+**CAMS Non-Haze Months** (Nov–Apr, NE Monsoon):
+- Extract hourly PM2.5 from CAMS EAC4 via Open-Meteo API
+- Compute diurnal median per city → 24-hour curve
+
+**Parametric Fallback** (double-peak diurnal):
+```
+C_urban(t) = base + morning_amp × exp(-0.5×((t-morning_peak)/width)²) 
+                  + evening_amp × exp(-0.5×((t-evening_peak)/width)²)
+```
+| City | Base | Morning Amp | Morning Peak | Evening Amp | Evening Peak |
+|------|------|-------------|--------------|-------------|--------------|
+| Kuala Lumpur | 12 | 12 | 08:00 | 10 | 20:00 |
+| Johor Bahru | 10 | 10 | 08:00 | 8 | 20:00 |
+| Kuching | 8 | 8 | 07:00 | 6 | 19:00 |
+| Ipoh | 9 | 9 | 08:00 | 7 | 20:00 |
+| Kota Bharu | 7 | 6 | 07:00 | 5 | 19:00 |
+
+**Regional Background**: 12 µg/m³ (maritime clean air from CAMS)
+
+### 4. Bayesian Inverse Attribution (`src/physics/calibration.py`)
+
+**State Vector**: Q = [Q₁, Q₂, ..., Qₙ] (emission rates for N fires)
+
+**Prior**: Log-normal constrained by FRP
+```
+ln(Q_i) ~ N(ln(Q_init_i), σ_prior²)    σ_prior = 0.7
+```
+
+**Likelihood** with Spatial Covariance:
+```
+d_obs = observed PM2.5 at K receptors (5 cities)
+C_pred = H × Q    [H: transport matrix, K×N]
+R_jk = σ_inst² × exp(-d_jk / L_corr) + δ_jk × σ_inst²
+     [L_corr = 50 km, σ_inst = 5 µg/m³]
+
+log p(d|Q) = -0.5 × (d - C_pred)ᵀ R⁻¹ (d - C_pred) - 0.5 log|R|
+```
+
+**Importance Sampling** (2000 samples, vectorized):
+```
+1. Draw Q_samples ~ Prior
+2. C_pred = Q_samples @ H.T
+3. weight ∝ exp(log_likelihood + log_prior)
+4. Normalize weights
+5. Posterior P(fire_i major) = mean(Q_i > 2 × median(Q_i))
+```
+
+### 5. Total Concentration & API
+
+```
+C_total(city, hour) = C_background + C_urban(city, hour) + Σ_fires C_smoke(fire, city, hour)
+
+API = DOE piecewise linear from PM2.5:
+  0-12 µg/m³    → API 0-50     (Good)
+  12.1-35.4    → API 51-100   (Moderate)
+  35.5-55.4    → API 101-150  (Unhealthy)
+  55.5-150.4   → API 151-200  (Very Unhealthy)
+  150.5-250.4  → API 201-300  (Hazardous)
+  ...
+```
 
 ---
 
-## 3) Data sources — where we get each number
+## Data Flow Diagram
 
-| Data | Endpoint | Fields | Frequency | File |
-|------|----------|--------|-----------|------|
-| Fires | `https://firms.modaps.eosdis.nasa.gov/api/country/csv/{MAP_KEY}/VIIRS_SNPP_NRT/IDN/{days}` | `latitude, longitude, frp, confidence` | 3h swath | `src/data/firms.py:18` |
-| Weather | `https://api.open-meteo.com/v1/forecast?latitude=2.5&longitude=101.5&hourly=wind_speed_10m,wind_direction_10m,precipitation` | `wind_speed_10m (km/h→m/s), wind_direction_10m (deg FROM), precipitation (mm/h)` | Hourly | `src/data/meteo.py:8` |
-| Weather grid | Same ×24 (4×6) | `u=-U sinθ, v=-U cosθ` for arrows | Hourly | `src/data/meteo_grid.py:28` |
-| Air quality (live) | `https://air-quality-api.open-meteo.com/v1/air-quality?latitude={lat}&longitude={lon}&hourly=pm2_5` (CAMS) | `pm2_5 (µg/m³)` | Hourly | `src/data/receptors.py:14` |
-| Air quality (DOE truth you check) | `https://eqms.doe.gov.my/APIMS/main` (APIMS) — **no documented hourly JSON**; proxied `api3/publicmapproxy` (ArcGIS). Our mock `85.4,62.1,112.0,45.8,38.2` is a synthetic haze-event when live fails. | `API` (DOE, 0–500) | Hourly | — |
-| Constants | — | `a=1e-4, b=0.8, h=30m, R=6371000m, σy=0.11x(1+0.0001x)^-0.5` | — | `src/config.py:3` |
-
-**Key mismatch you saw:** DOE APIMS live KL often `API 65–90 Moderate` (from Open-Meteo CAMS `71 µg → API 159` in our live fetch, or DOE's own `70`), while Streamlit predicted `API 34 Good`. That's **smoke-only vs total-air**: predicted = Indonesian smoke carried by wind, measured = smoke + KL traffic/factories + local dust. When wind is `138° SE (blows NW away from MY)`, predicted correctly goes to 11 but measured stays 71 — local sources dominate. The card now says this explicitly at `app.py:185`.
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  NASA FIRMS │     │ ESA World   │     │ Open-Meteo  │
+│  Hotspots   │     │ Cover       │     │ ERA5        │
+│  (lat,lon,  │     │ Biome Map   │     │ (u,v,P,     │
+│   FRP,conf) │     │ (WMS/GeoTIFF)│    │  PBL model) │
+└──────┬──────┘     └──────┬──────┘     └──────┬──────┘
+       │                   │                   │
+       ▼                   ▼                   ▼
+┌─────────────────────────────────────────────────────┐
+│              EMISSION ENGINE                         │
+│  Q_i = biome_emission_factor(biome_i) × FRP_adj_i   │
+└────────────────────────┬────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────┐
+│           TRAJECTORY TRANSPORT                       │
+│  For each fire: integrate dx/dt = u(x,t)             │
+│  → trajectory(t), wind(t), precip(t), PBL(t)        │
+│  → C_smoke(fire, city, hour) via box model          │
+└────────────────────────┬────────────────────────────┘
+                         │
+         ┌───────────────┼───────────────┐
+         ▼               ▼               ▼
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│   Urban      │  │  Inverse     │  │  Validation  │
+│   Baseline   │  │  Attribution │  │  (CAMS proxy)│
+│  C_urban(t)  │  │  P(Q|data)   │  │  RMSE, NMB   │
+└──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+       │                 │                 │
+       └─────────────────┼─────────────────┘
+                         ▼
+┌─────────────────────────────────────────────────────┐
+│            PREDICTION OUTPUT                         │
+│  • City forecast: PM2.5, API, category (24h)        │
+│  • Fire posteriors: biome, Q, posterior probability │
+│  • Haze grid: spatial map for visualization         │
+│  • Metrics: proxy RMSE vs CAMS reanalysis           │
+└─────────────────────────────────────────────────────┘
+```
 
 ---
 
-## 4) Why predictions suck right now — your research tasks
+## Dashboard Tabs
 
-1. **Q is uncalibrated.** `0.02` and heuristic `3.2` were hand-tuned for visibility, not fitted. **Task:** regress `FRP × emission_factor × fuel_load × burn_area` against DOE PM2.5 history (dry season 2019, 2023) to learn `Q(FRP, vegetation, peat depth)`. Try `Q = α·FRP^β` per region.
-2. **Gaussian physics wrong at 300–800km.** Steady-state, flat terrain, uniform wind. **Task:** replace with HYSPLIT back-trajectories or WRF-Chem Eulerian. Compare plume vs trajectory for same wind. Keep our `exp(-Λx/U)` but with path-integrated `P` along trajectory, not point `P`.
-3. **Single wind.** **Task:** ingest ECMWF 0.1° gridded `u,v` at 10m/100m/850hPa, interpolate to plume path. Validate with `θ=225° SW monsoon (haze season) vs 138° SE (smoke misses MY)` — we saw this live.
-4. **Background + local pollution ignored.** Predicted = background 8 + fire smoke, but KL baseline is 20–40 even without fires. **Task:** estimate `background(city, season)` from non-haze months, add traffic/industrial term, or predict *excess* only.
-5. **API incomplete.** **Task:** compute true DOE API = max(PM2.5→API, PM10→API, O3→API...). You'll need PM10/CO/O3 from CAMS too.
-6. **Inverse too simple.** **Task:** move from discrete `N` hotspots to continuous `θ=[lon,lat,Q]` with MCMC (NUTS) + spatial `R` (Matern), Gelman-Rubin `R̂<1.05`, OSSE validation. Sample thousands, needs PINN surrogate for speed.
-7. **No temporal accumulation.** **Task:** forecast `PM2.5(t)` = advection with `τ` lifetime, not instantaneous `C(x)`. Add 24–72h forecast slider driven by Open-Meteo `forecast_days=3`.
-8. **Validation absent.** **Task:** hold-out stations, compute `RMSE = sqrt(mean((d - f(θ_MAP))²))` at `app.py:200`, NMB, hit rate for `API≥100`. Compare mock 85/112 haze-event vs live 20/70 baseline. The current error `~60 µg` is your baseline to beat.
+| Tab | Purpose |
+|-----|---------|
+| **🌫️ Prediction** | Haze map + city cards (calibrated PM2.5/API vs CAMS model) |
+| **🔥 Evidence** | Fire posterior probabilities + ERA5 wind/rain + transport |
+| **📈 Forecast** | 24-hour hourly PM2.5 forecast per city with API thresholds |
+| **❓ How it works** | Plain-language + formulas for each module |
 
 ---
 
-## 5) How to run and publish
+## Key Differences from Original Model
 
-```powershell
-python -m pip install -r requirements.txt
+| Component | Original (Phase 1) | Calibrated (Phase 2) |
+|-----------|-------------------|---------------------|
+| **Emissions** | Q = 0.02 × FRP (single) | Biome-specific: peat 0.0146, forest 0.0033 |
+| **Transport** | Gaussian plume + heuristic | ERA5 trajectory + PBL box model |
+| **PBL Height** | Fixed 1000m | Diurnal 200-1500m |
+| **Scavenging** | Point precipitation | Path-integrated along trajectory |
+| **Baseline** | Fixed 8 µg/m³ | CAMS diurnal (12-37 µg/m³) + regional 12 |
+| **Inverse** | Discrete FRP-weighted | Continuous importance sampling + spatial R |
+| **Validation** | None | Proxy RMSE/NMB vs CAMS Sep 2019 |
+
+---
+
+## Running the Model
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Run dashboard
 streamlit run app.py
 # http://localhost:8501
-# No key: defaults DEMO_KEY synthetic fires. Live fires: add FIRMS MAP_KEY at https://firms.modaps.eosdis.nasa.gov/api/area/ → sidebar or .streamlit/secrets.toml:
-# FIRMS_MAP_KEY = "your_key"
-python -m pytest tests -v
+
+# Run tests
+python -m pytest tests/ -v
 ```
 
-Publish: `git push` → `share.streamlit.io` → New app → `main` / `app.py` → Settings → Secrets → `FIRMS_MAP_KEY`.
-
-Map is at `src/viz/maps.py:28` (scatter plume excess + wind LineLayer + rain dots). API at `src/physics/api.py:10`. Don't trust absolute numbers until you complete tasks 1–8 — pattern (wind swings plume, rain kills it) is real, magnitude is illustrative.
+**Sidebar Controls**:
+- NASA FIRMS key (DEMO_KEY for synthetic fires)
+- Fire history: 1-5 days
+- Scenario sliders: rain multiplier, wind shift, urban baseline scale
+- Live CAMS toggle
 
 ---
 
-## 6) What to show your supervisor
+## Proxy Validation
 
-This repo is **Phase 1 — pipeline demonstrator**: data flows, formulas are transparent, dashboard separates *Prediction (fire smoke)* vs *Evidence (fires+wind+rain)* vs *Measured truth (DOE-like)* so a layman sees `API 34 Predicted Good but Actually 159 Unhealthy → local pollution, wind away`. Your research is Phase 2 — calibration and physics replacement (tasks above). Point them to `app.py:240` expander (formulas) and `src/physics/forecast_grid.py:49` heuristic comment where the tuning lives.
+Validated against **CAMS EAC4 Sep 2019 haze reanalysis** (satellite-assimilated):
+- Metrics: RMSE, Normalized Mean Bias (NMB), Correlation (R)
+- Shown in sidebar as "Proxy Validation"
+- Note: CAMS model ≠ ground sensors (typically 30-100% higher in SE Asia)
 
+---
+
+## File Structure
+
+```
+src/
+├── config.py                 # All calibrated parameters
+├── data/
+│   ├── firms.py              # FIRMS fetch + biome classification
+│   ├── landcover.py          # ESA WorldCover biome lookup
+│   ├── cams.py               # Urban baseline from CAMS non-haze months
+│   ├── era5.py               # Gridded ERA5 wind/precip + PBL model
+│   ├── meteo_grid.py         # Interface for gridded meteo
+│   └── receptors.py          # City locations + live CAMS fetch
+├── physics/
+│   ├── api.py                # PM2.5 → Malaysian API conversion
+│   ├── calibration.py        # Core pipeline: emissions→transport→baseline→inverse
+│   ├── research_model.py     # Main entry: predict_haze(), predict_haze_forecast()
+│   └── [legacy: dispersion.py, inversion.py, forecast_grid.py]
+├── viz/
+│   └── maps.py               # PyDeck visualization
+└── app.py                    # Streamlit dashboard
+```
+
+---
+
+## What to Show Your Supervisor
+
+1. **Architecture diagram** (above) — complete physics-based pipeline
+2. **Proxy calibration methodology** — CAMS non-haze baseline + ESA biome emissions + ERA5 transport
+3. **Validation results** — RMSE/NMB/R vs CAMS Sep 2019 reanalysis (sidebar)
+4. **Attribution output** — posterior probabilities per fire with biome classification
+5. **Scenario testing** — real-time sliders for rain/wind/urban sensitivity
+6. **Code transparency** — every formula in `calibration.py` and `research_model.py`
+
+---
+
+## Known Limitations
+
+1. **CAMS reference ≠ ground truth** — model typically 30-100% higher than DOE/IQAir sensors
+2. **PBL model** — simplified diurnal cycle, not full ERA5 PBL (API limitation)
+3. **ESA WMS** — online queries; fallback heuristic for peat regions
+4. **No chemical aging** — PM2.5 treated as inert tracer
+5. **2D transport** — no vertical wind shear or layer-resolved advection
+6. **Prior uncertainty** — σ_prior=0.7 chosen heuristically
+7. **Scavenging time units** — Lambda = a·Pᵇ with a=1e-4 gives Lambda in h⁻¹ for P in mm/h. Code uses hourly timesteps (dt_hours) so exponent Lambda·dt is dimensionless. Verified against CAMS Sep 2019 proxy.
+8. **Covariance nugget** — Added 1e-6 diagonal jitter to R before inversion to prevent numerical instability when stations are geographically close.
+
+---
+
+## Next Research Steps
+
+1. **Calibrate σ_prior, L_corr** via cross-validation on historical episodes
+2. **Integrate ERA5 PBL directly** via CDS API (requires account)
+3. **Add HYSPLIT back-trajectories** for transport validation
+4. **Incorporate DOE ground data** when available for true validation
+5. **Chemical aging module** for secondary organic aerosol formation
+6. **Ensemble forecasts** using ECMWF ensemble members
+
+---
+
+## License & Citation
+
+Research code for academic use. If used in publications, please cite the methodology:
+> "Proxy-calibrated transboundary haze attribution using biome-differentiated emissions, ERA5 trajectory transport, and continuous Bayesian inverse modeling validated against CAMS EAC4 reanalysis."

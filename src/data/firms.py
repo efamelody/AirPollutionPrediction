@@ -1,5 +1,6 @@
 import pandas as pd
 import streamlit as st
+from src.data.landcover import add_biome_column, calculate_Q
 
 
 def _synthetic_hotspots() -> pd.DataFrame:
@@ -10,7 +11,11 @@ def _synthetic_hotspots() -> pd.DataFrame:
         "confidence": [90, 85, 95, 78, 92],
         "acq_date": ["2023-10-01"] * 5,
     }
-    return pd.DataFrame(data)
+    df = pd.DataFrame(data)
+    # Add biome classification to synthetic data
+    df = add_biome_column(df)
+    df["Q_init"] = df.apply(lambda r: calculate_Q(r["frp"], r["biome"]), axis=1)
+    return df
 
 
 def fetch_firms_hotspots(map_key: str, country_code: str = "IDN", days: int = 1) -> pd.DataFrame:
@@ -32,6 +37,10 @@ def fetch_firms_hotspots(map_key: str, country_code: str = "IDN", days: int = 1)
         if df.empty:
             st.warning("FIRMS returned no hotspots for the window. Using synthetic fallback.")
             return _synthetic_hotspots()
+        
+        # Add biome classification and calibrated Q
+        df = add_biome_column(df)
+        df["Q_init"] = df.apply(lambda r: calculate_Q(r["frp"], r["biome"]), axis=1)
         return df
     except Exception as e:
         st.warning(f"Unable to reach NASA FIRMS API ({e}). Loading synthetic fallback data.")

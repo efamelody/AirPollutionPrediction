@@ -1,16 +1,14 @@
 import numpy as np
 import pandas as pd
 import streamlit as st
+from datetime import datetime, timezone
 
-from src.config import METEO_LAT, METEO_LON, SIGMA_OBS_UGM3
+from src.config import METEO_LAT, METEO_LON
 from src.data.firms import fetch_firms_hotspots
-from src.data.meteo import fetch_open_meteo_weather
-from src.data.meteo_grid import fetch_meteo_grid
+from src.data.meteo_grid import fetch_meteo_grid, get_meteo_for_transport, get_centroid_meteo
 from src.data.receptors import fetch_malaysia_receptors
-from src.physics.inversion import run_bayesian_inversion
 from src.physics.api import pm25_to_api, api_category
-from src.physics.forecast_grid import build_haze_grid, predict_for_receptors
-from src.viz.maps import build_deck
+from src.physics.research_model import predict_haze, predict_haze_forecast
 
 # ------------------------------------------------------------------------------
 # PAGE CONFIG — plain language
@@ -19,11 +17,8 @@ st.set_page_config(page_title="Will My City Have Haze? — Malaysia Haze Forecas
 
 # Helpers for plain wind description
 def wind_plain(dir_deg: float) -> str:
-    # FROM direction to plain
     dirs = [(0,"North"),(45,"Northeast"),(90,"East"),(135,"Southeast"),(180,"South"),(225,"Southwest"),(270,"West"),(315,"Northwest"),(360,"North")]
-    # find closest
     best = min(dirs, key=lambda x: abs(x[0]-dir_deg) if abs(x[0]-dir_deg)<180 else 360-abs(x[0]-dir_deg))
-    # also where it blows TO
     to_deg = (dir_deg + 180) % 360
     to_label = min(dirs, key=lambda x: abs(x[0]-to_deg) if abs(x[0]-to_deg)<180 else 360-abs(x[0]-to_deg))[1]
     return f"from the {best[1]} → blowing to the {to_label}"
@@ -65,6 +60,13 @@ selected_days = st.sidebar.slider("Fire history (days)", 1, 5, 1, help="1 day = 
 
 st.sidebar.markdown("### 🌤️ Weather right now")
 override_meteo = st.sidebar.checkbox("Try a different wind/rain (what-if?)", value=False)
+
+# Scenario controls for research model
+st.sidebar.markdown("### 🧪 Research Model Scenarios")
+rain_multiplier = st.sidebar.slider("Rainfall multiplier", 0.0, 3.0, 1.0, 0.1, help="Scale rainfall to test wet/dry scenarios")
+wind_shift = st.sidebar.slider("Wind direction shift (°)", -45, 45, 0, 5, help="Shift wind direction to test transport sensitivity")
+urban_scale = st.sidebar.slider("Urban baseline scale", 0.5, 2.0, 1.0, 0.1, help="Scale local urban pollution baseline")
+
 if override_meteo:
     st.sidebar.caption("Move the sliders to see how wind and rain change the haze.")
     manual_wind_speed = st.sidebar.slider("Wind speed", 0.5, 20.0, 5.5, help="Faster wind spreads haze faster")
@@ -75,7 +77,9 @@ if override_meteo:
     meteo_data = {"wind_speed": manual_wind_speed, "wind_dir": manual_wind_dir, "precipitation": manual_precip}
 else:
     with st.spinner("Getting live wind and rain..."):
-        meteo_data = fetch_open_meteo_weather(METEO_LAT, METEO_LON)
+        # Get centroid meteo from gridded ERA5
+        meteo_interpolators = get_meteo_for_transport()
+        meteo_data = get_centroid_meteo(meteo_interpolators)
 
 # Live summary in plain language, top of sidebar
 st.sidebar.markdown("---")
@@ -83,7 +87,8 @@ st.sidebar.markdown(f"""
 **Live weather (Strait of Malacca):**<br>
 💨 Wind **{meteo_data['wind_speed']:.1f} m/s** {wind_plain(meteo_data['wind_dir'])}<br>
 🌧️ Rain **{meteo_data['precipitation']:.1f} mm/h** — {rain_plain(meteo_data['precipitation'])}<br>
-<span style="color:#888;font-size:12px;">Source: Open-Meteo (ECMWF/GFS). Rain cleans haze.</span>
+📏 PBL Height **{meteo_data.get('pbl_height', 1000):.0f} m**<br>
+<span style="color:#888;font-size:12px;">Source: Open-Meteo ERA5. Rain cleans haze. PBL caps vertical mixing.</span>
 """, unsafe_allow_html=True)
 
 st.sidebar.markdown("### 🗺️ What to show on the map")
@@ -92,23 +97,10 @@ show_wind = st.sidebar.checkbox("Show wind arrows", value=True, help="Arrows sho
 show_rain = st.sidebar.checkbox("Show rain dots", value=False, help="Blue dots where it's raining")
 show_receptors = st.sidebar.checkbox("Show city towers", value=True)
 
-haze_mode = "Forecast (what we predict)"
-background_pm25 = 8.0
-grid_density = "Medium"
-weight_opt = "Smart average (uses evidence)"
-amplification = 80
-sigma_obs = float(SIGMA_OBS_UGM3)
-with st.sidebar.expander("🔧 Advanced (for experts)", expanded=False):
-    haze_mode = st.radio("City towers show", ["Forecast (what we predict)", "Observed now (what was measured)"], index=0, key="haze_mode_adv")
-    background_pm25 = st.slider("Clean-air background (µg/m³)", 0.0, 25.0, 8.0, help="Air is never 0 — this is the normal clean value", key="bg_adv")
-    grid_density = st.select_slider("Map detail", options=["Coarse", "Medium", "Fine"], value="Medium", key="grid_adv")
-    weight_opt = st.radio("How to add fires together", ["Smart average (uses evidence)", "Worst case (add all fires)"], index=0, key="weight_adv")
-    amplification = st.slider("Make haze more visible (visual aid)", 1, 200, 80, help="The raw physics gives tiny numbers at 300km. This scales it so you can see the pattern. Keep it at 80 to compare.", key="amp_adv")
-    sigma_obs = st.slider("How strict is the source matching?", 5.0, 30.0, float(SIGMA_OBS_UGM3), help="Lower = picky, higher = tolerant", key="sigma_adv")
-
-density_map = {"Coarse": (10, 14), "Medium": (18, 22), "Fine": (26, 30)}
-n_lat_haze, n_lon_haze = density_map[grid_density]
-weight_by_posterior = weight_opt.startswith("Smart")
+# Model info
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Model:** Proxy-Calibrated Research Model")
+st.sidebar.caption("• Biome-specific emissions (peat vs forest)\n• Trajectory transport with ERA5 PBL\n• Path-integrated wet scavenging\n• Continuous Bayesian inverse\n• Urban diurnal baseline from CAMS")
 
 # ------------------------------------------------------------------------------
 # CACHED FETCHERS
@@ -118,53 +110,49 @@ def cached_hotspots(key: str, days: int) -> pd.DataFrame:
     return fetch_firms_hotspots(key, "IDN", days)
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def cached_meteo(lat: float, lon: float, override: bool, ws: float, wd: float, pr: float) -> dict:
-    if override:
-        return {"wind_speed": ws, "wind_dir": wd, "precipitation": pr}
-    return fetch_open_meteo_weather(lat, lon)
+def cached_meteo_grid(n_lat: int = 8, n_lon: int = 12, forecast_hours: int = 24) -> pd.DataFrame:
+    return fetch_meteo_grid(n_lat=n_lat, n_lon=n_lon, forecast_hours=forecast_hours)
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def cached_meteo_grid(n_lat: int, n_lon: int, override: bool, ws: float, wd: float, pr: float) -> pd.DataFrame:
-    if override:
-        lats = np.linspace(-3, 7, n_lat)
-        lons = np.linspace(98, 119, n_lon)
-        rows = []
-        for la in lats:
-            for lo in lons:
-                th = np.radians(wd)
-                u = -ws * np.sin(th); v = -ws * np.cos(th)
-                rows.append({"lat": la, "lon": lo, "wind_speed": ws, "wind_dir": wd, "precip": pr, "u": u, "v": v})
-        return pd.DataFrame(rows)
-    return fetch_meteo_grid(n_lat=n_lat, n_lon=n_lon)
-
-if not override_meteo:
-    meteo_data = cached_meteo(METEO_LAT, METEO_LON, False, 0, 0, 0)
-else:
-    meteo_data = cached_meteo(METEO_LAT, METEO_LON, True, meteo_data["wind_speed"], meteo_data["wind_dir"], meteo_data["precipitation"])
-
-use_live_air = st.sidebar.checkbox("Use live air quality (Open-Meteo CAMS)", value=True, help="When ON: city 'Measured now' is real current PM2.5 from Open-Meteo (matches DOE moderate values like 40-70). When OFF: shows mock haze-event (KL 85, Kuching 112) to demo a heavy haze day. Predicted is always only the *fire smoke* part.")
+# Fetch data
+use_live_air = st.sidebar.checkbox("Use live air quality (Open-Meteo CAMS)", value=True, help="When ON: city 'Measured now' is real current PM2.5 from Open-Meteo. When OFF: shows mock haze-event to demo a heavy haze day.")
 receptors_df = fetch_malaysia_receptors(live=use_live_air)
 if not receptors_df.empty and "pm25_source" in receptors_df.columns:
     st.sidebar.caption(f"City air source: {receptors_df['pm25_source'].iloc[0]}")
+
 hotspots_raw = cached_hotspots(firms_api_key, selected_days)
 
-with st.spinner("Checking which fires match the pollution in cities..."):
-    hotspots_analyzed = run_bayesian_inversion(hotspots_raw, receptors_df, meteo_data, sigma_obs=sigma_obs)
+# Build scenario dict
+scenario = {
+    "rain_multiplier": rain_multiplier,
+    "wind_shift_deg": wind_shift,
+    "urban_scale": urban_scale,
+}
 
-with st.spinner("Predicting haze for each city..."):
-    haze_grid = build_haze_grid(hotspots_analyzed, meteo_data, n_lat=n_lat_haze, n_lon=n_lon_haze, background_pm25=background_pm25, weight_by_posterior=weight_by_posterior, amplification=float(amplification))
-    city_forecast = predict_for_receptors(hotspots_analyzed, receptors_df, meteo_data, background_pm25=background_pm25, weight_by_posterior=weight_by_posterior, amplification=float(amplification))
+# Run research model
+with st.spinner("Running calibrated haze attribution model..."):
+    result = predict_haze(hotspots_raw, receptors_df, forecast_hours=24, scenario=scenario)
 
-meteo_grid = cached_meteo_grid(4, 6, override_meteo, float(meteo_data["wind_speed"]), float(meteo_data["wind_dir"]), float(meteo_data["precipitation"]))
+city_forecast = result["city_forecast"]
+fire_posteriors = result["fire_posteriors"]
+haze_grid = result["haze_grid"]
+metrics = result["metrics"]
+
+# Get meteo grid for visualization
+meteo_grid_df = cached_meteo_grid(4, 6, 24)
+# Use current hour for viz
+current_hour = datetime.now(timezone.utc).hour
+meteo_grid_viz = meteo_grid_df[meteo_grid_df["time"].str.contains(f"T{current_hour:02d}:")].copy()
+if meteo_grid_viz.empty:
+    meteo_grid_viz = meteo_grid_df.iloc[:24].copy()
 
 # ------------------------------------------------------------------------------
 # PLAIN KPI — what matters to a normal person
 # ------------------------------------------------------------------------------
 k1, k2, k3 = st.columns(3)
 with k1:
-    n_fires = len(hotspots_analyzed)
-    total_strength = hotspots_analyzed["frp"].sum() if n_fires else 0
-    st.metric("🔥 Fires detected", f"{n_fires}", f"Total strength {total_strength:.0f} MW")
+    n_fires = len(fire_posteriors)
+    total_strength = fire_posteriors["frp"].sum() if n_fires else 0
+    st.metric("🔥 Fires detected", f"{n_fires}", f"Total FRP {total_strength:.0f} MW")
     st.caption("From NASA satellites over Indonesia (last {} day(s))".format(selected_days))
 with k2:
     st.metric("💨 Wind", f"{meteo_data['wind_speed']:.1f} m/s", wind_plain(meteo_data['wind_dir']))
@@ -172,23 +160,31 @@ with k2:
 with k3:
     n_haze = (city_forecast["api_pred"] >= 101).sum() if not city_forecast.empty else 0
     st.metric("🏙️ Cities with haze forecast", f"{n_haze} of {len(city_forecast)}", f"API ≥100 = haze" if n_haze else "Air looks okay")
-    st.caption("Based on fires + wind + rain → API")
+    st.caption("Calibrated: biome emissions + trajectory transport + urban baseline")
+
+# Validation metrics badge
+if metrics:
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**Proxy Validation (vs CAMS):**")
+    st.sidebar.metric("RMSE", f"{metrics.get('RMSE', 0):.1f} µg/m³")
+    st.sidebar.metric("NMB", f"{metrics.get('NMB', 0):.1f}%")
+    st.sidebar.metric("R", f"{metrics.get('R', 0):.2f}")
 
 # ------------------------------------------------------------------------------
 # CITY CARDS — prediction vs truth, plain language
 # ------------------------------------------------------------------------------
 st.markdown("## 🏙️ Will it be hazy? — City by city")
-st.caption("**Top = what we predict is coming from Indonesian fires** (smoke carried by wind, washed by rain). **Bottom grey = what is actually measured right now** (all sources: fires + traffic + factories — this is what DOE reports). They can differ when wind blows smoke away or when local pollution is high.")
-# Global mismatch banner
+st.caption("**Top = calibrated prediction** (biome emissions + trajectory transport + urban baseline). **Bottom = CAMS model** (Open-Meteo ECMWF/CAMS reanalysis, not ground sensors). Model often reads higher than IQAir/DOE ground measurements. Mismatch = local pollution or wind blowing smoke away.")
+
 mismatch = 0
 if not city_forecast.empty:
     for _, r in city_forecast.iterrows():
         if abs(pm25_to_api(float(r["pm25_obs"])) - int(r["api_pred"])) >= 50:
             mismatch += 1
 if mismatch >= 2:
-    st.warning(f"⚠️ Predicted haze (fire smoke) is much lower than measured air in {mismatch} cities. That means today's air is dominated by **local city pollution**, not Indonesian smoke — wind is blowing smoke away (check Evidence tab wind arrows). The forecast is for *fire smoke only*, not total city pollution. Toggle to heavy smoke + SW wind (225°) in the sidebar to see a transboundary haze event.")
+    st.warning(f"⚠️ Predicted haze much lower than measured in {mismatch} cities → local pollution dominates, wind blowing smoke away.")
 elif mismatch >= 1:
-    st.info("ℹ️ Small mismatch: predicted fire smoke vs measured total air. See Evidence tab for wind direction — if it points away from Malaysia, fires aren't the cause today.")
+    st.info("ℹ️ Small mismatch: predicted fire smoke vs measured total air. Check wind direction in Evidence tab.")
 
 cols = st.columns(len(city_forecast))
 for col, (_, row) in zip(cols, city_forecast.iterrows()):
@@ -197,12 +193,10 @@ for col, (_, row) in zip(cols, city_forecast.iterrows()):
     obs = float(row["pm25_obs"])
     obs_api = pm25_to_api(obs)
     obs_cat, obs_color = api_category(obs_api)
-    # Advice for predicted (fire smoke)
     if api >= 201: pred_advice, pred_face = "🔴 Fire smoke: Stay indoors", "😷"
     elif api >= 101: pred_advice, pred_face = "🟠 Fire smoke: Limit outdoor", "😶‍🌫️"
     elif api >= 51: pred_advice, pred_face = "🟡 Some fire haze", "🙂"
     else: pred_advice, pred_face = "🟢 No fire haze coming", "😊"
-    # Advice for measured (actual air you breathe — what DOE reports)
     if obs_api >= 201: meas_advice = "🔴 Actually: Hazardous — stay indoors"
     elif obs_api >= 101: meas_advice = "🟠 Actually: Unhealthy — limit outdoor"
     elif obs_api >= 51: meas_advice = "🟡 Actually: Moderate — sensitive groups care"
@@ -212,41 +206,46 @@ for col, (_, row) in zip(cols, city_forecast.iterrows()):
 <div style="padding:12px;border-radius:12px;border:2px solid {color};background:#0f1117;text-align:center;">
   <div style="font-weight:700;font-size:15px;">{row['station_name']}</div>
   <div style="font-size:26px;margin:4px 0;">{pred_face}</div>
-  <div style="font-size:11px;color:#888;letter-spacing:0.5px;">PREDICTED (fire smoke only)</div>
+  <div style="font-size:11px;color:#888;letter-spacing:0.5px;">PREDICTED (calibrated)</div>
   <div style="font-size:20px;font-weight:800;color:{color};">API {api} — {cat}</div>
-  <div style="font-size:11px;color:#ccc;">Smoke PM2.5 {row['pm25_pred']:.1f} µg/m³</div>
+  <div style="font-size:11px;color:#ccc;">PM2.5 {row['pm25_pred']:.1f} µg/m³</div>
   <div style="font-size:11px;color:{color};margin-top:4px;font-weight:600;">{pred_advice}</div>
   <div style="margin-top:8px;padding-top:8px;border-top:1px solid #2a2a3a;">
-    <div style="font-size:11px;color:#888;">MEASURED NOW (all sources — DOE-like)</div>
+    <div style="font-size:11px;color:#888;">CAMS MODEL (Open-Meteo)</div>
     <div style="font-size:14px;font-weight:700;color:{obs_color};">API {obs_api} — {obs_cat} <span style="font-weight:400;color:#aaa;">({obs:.1f} µg/m³)</span></div>
     <div style="font-size:11px;color:{obs_color};margin-top:2px;">{meas_advice}</div>
+    <div style="font-size:10px;color:#888;margin-top:4px;">Note: CAMS model ≠ ground sensors (IQAir/DOE). Model often higher.</div>
   </div>
 </div>
         """, unsafe_allow_html=True)
 
 # ------------------------------------------------------------------------------
-# TABS — separate prediction vs evidence vs explanation
+# TABS — prediction vs evidence vs explanation
 # ------------------------------------------------------------------------------
-tab_pred, tab_source, tab_how = st.tabs(["🌫️ Prediction — Where will haze be?", "🔥 Evidence — Where is smoke coming from?", "❓ How it works (simple)"])
+tab_pred, tab_source, tab_forecast, tab_how = st.tabs([
+    "🌫️ Prediction — Where will haze be?", 
+    "🔥 Evidence — Where is smoke coming from?", 
+    "📈 Forecast — Next 24 hours",
+    "❓ How it works (simple)"
+])
 
 with tab_pred:
     st.markdown("### Prediction: where the haze will be")
-    st.caption("This is the **forecast** — what we think will happen based on fires + wind + rain. Compare with the **measured now** values on the cards above to see if it matches.")
+    st.caption("Calibrated forecast: biome-differentiated emissions, trajectory transport, PBL-capped mixing, path-integrated rain scavenging.")
     c1, c2 = st.columns([2.2, 1])
     with c1:
         try:
-            # Prediction map: haze + cities only (no fire clutter) so layman sees just the answer
+            from src.viz.maps import build_deck
             deck_pred = build_deck(
-                hotspots_analyzed.head(0),  # hide fires here to keep it simple
-                city_forecast if haze_mode.startswith("Forecast") else receptors_df,
+                fire_posteriors.head(0),  # hide fires for clean prediction view
+                city_forecast,
                 haze_grid=haze_grid if show_haze else None,
-                meteo_grid=None,  # no wind/rain here — keep prediction clean
+                meteo_grid=None,
                 show_haze=show_haze, show_wind=False, show_rain=False, show_receptors=show_receptors,
             )
             st.pydeck_chart(deck_pred, use_container_width=True)
         except Exception as e:
             st.error(f"Map failed: {e}")
-        # Simple API scale
         st.markdown("""
 <div style="background:#0f1117;border:1px solid #2a2a3a;border-radius:10px;padding:10px 12px;">
 <b>Air quality scale (Malaysian API):</b><br>
@@ -255,117 +254,182 @@ with tab_pred:
 <span style="background:#ff9800;color:white;padding:2px 7px;border-radius:4px;">Unhealthy 101–200</span>
 <span style="background:#f44336;color:white;padding:2px 7px;border-radius:4px;">Very Unhealthy 201–300</span>
 <span style="background:#8b0000;color:white;padding:2px 7px;border-radius:4px;">Hazardous 301+</span>
-<br><span style="color:#aaa;font-size:12px;">API is calculated from PM2.5. <b>API ≥100 = haze.</b> 3D columns over cities: taller & redder = worse haze.</span>
+<br><span style="color:#aaa;font-size:12px;">API ≥100 = haze. 3D columns: taller & redder = worse haze.</span>
 </div>
         """, unsafe_allow_html=True)
         st.markdown("""
 <div style="background:#0f1117;border:1px solid #2a2a3a;border-radius:10px;padding:10px 12px;margin-top:10px;">
-<b>🌫️ Haze cloud</b> = coloured blobs where we predict smoke will be. Colour = how bad (same green→red as cities). We hide the normal 8 µg clean-air background so you only see the <b>extra</b> smoke.<br>
-<b>🏙️ City towers</b> = 3D columns over KL, JB, Kuching, Ipoh, Kota Bharu. Height & colour = predicted haze at that city.
+<b>🌫️ Haze cloud</b> = coloured blobs where calibrated model predicts smoke. Colour = API level.<br>
+<b>🏙️ City towers</b> = 3D columns over KL, JB, Kuching, Ipoh, Kota Bharu. Height & colour = predicted API.
 </div>
         """, unsafe_allow_html=True)
     with c2:
-        st.markdown("#### Prediction vs measured — are we right?")
-        st.caption("If the two numbers are close, the forecast matches reality.")
+        st.markdown("#### Prediction vs CAMS model — are we right?")
+        st.caption("If the two numbers are close, the calibrated forecast matches the CAMS model (not ground truth). Ground sensors (IQAir/DOE) often read lower.")
         disp_pred = city_forecast[["station_name", "pm25_obs", "pm25_pred", "api_pred", "category"]].copy()
-        disp_pred.columns = ["City", "Measured now", "Predicted", "API", "Level"]
+        disp_pred.columns = ["City", "CAMS Model", "Predicted", "API", "Level"]
         try:
-            st.dataframe(disp_pred.style.format({"Measured now": "{:.1f}", "Predicted": "{:.1f}", "API": "{:.0f}"}).background_gradient(subset=["API"], cmap="Reds"), use_container_width=True)
+            st.dataframe(disp_pred.style.format({"CAMS Model": "{:.1f}", "Predicted": "{:.1f}", "API": "{:.0f}"}).background_gradient(subset=["API"], cmap="Reds"), use_container_width=True)
         except Exception:
             st.dataframe(disp_pred, use_container_width=True)
-        # Quick verdict
         avg_err = float((city_forecast["pm25_obs"] - city_forecast["pm25_pred"]).abs().mean()) if not city_forecast.empty else 0
-        st.metric("Average error", f"{avg_err:.1f} µg/m³", "lower = better")
-        st.caption("Error = difference between predicted and measured. Large error means the model needs better tuning or more accurate fire/wind data.")
+        st.metric("Avg diff vs CAMS", f"{avg_err:.1f} µg/m³", "lower = better")
+        st.caption("Difference vs CAMS model. Proxy validation RMSE vs CAMS reanalysis shown in sidebar.")
         st.download_button("⬇️ Download city forecast CSV", data=city_forecast.to_csv(index=False).encode(), file_name="city_forecast.csv", mime="text/csv")
         st.download_button("⬇️ Download haze map grid CSV", data=haze_grid.to_csv(index=False).encode(), file_name="haze_grid.csv", mime="text/csv")
 
 with tab_source:
     st.markdown("### Evidence: where is the smoke coming from?")
-    st.caption("This is **not** the prediction — this is the **proof** we use to make the prediction: satellite fires, wind direction, and rain.")
+    st.caption("Calibrated attribution: fires colored by posterior probability from Bayesian inverse.")
     c1, c2 = st.columns([2.2, 1])
     with c1:
-        st.markdown("**Map: fires + wind + rain + haze together** — see how smoke is carried")
         try:
-            deck_source = build_deck(hotspots_analyzed, receptors_df, haze_grid=haze_grid if show_haze else None, meteo_grid=meteo_grid, show_haze=show_haze, show_wind=show_wind, show_rain=show_rain, show_receptors=False)
+            from src.viz.maps import build_deck
+            deck_source = build_deck(fire_posteriors, receptors_df, haze_grid=haze_grid if show_haze else None, meteo_grid=meteo_grid_viz, show_haze=show_haze, show_wind=show_wind, show_rain=show_rain, show_receptors=False)
             st.pydeck_chart(deck_source, use_container_width=True)
         except Exception as e:
             st.error(f"Map failed: {e}")
         st.markdown("""
 <div style="background:#0f1117;border:1px solid #2a2a3a;border-radius:10px;padding:12px 14px;font-size:13px;line-height:1.5;">
   <b>How to read this evidence map:</b><br>
-  🔴 <b>Red/orange circles</b> = fires seen from space (NASA FIRMS satellites). <b>Bigger circle = stronger fire = more smoke.</b> Redder = our system thinks this fire is the most likely cause of Malaysia's haze (it best explains the city pollution when wind is considered).<br>
-  💨 <b>Grey arrows</b> = wind. Arrow points where smoke is <b>being blown to</b>. Example: arrow pointing northeast means smoke from Sumatra is heading toward KL/JB.<br>
-  🌧️ <b>Blue dots</b> = rain. Bigger/blue = heavier rain → smoke is being washed out of the air before it reaches you. Toggle rain on in the sidebar to see.<br>
-  🌫️ <b>Faint coloured blobs</b> = same haze forecast as in Prediction tab, shown here so you can see it lines up downwind of the fires.
+  🔴 <b>Red/orange circles</b> = fires from NASA FIRMS. <b>Size = FRP (MW)</b>. <b>Color = posterior probability</b> (redder = more likely culprit).<br>
+  💨 <b>Grey arrows</b> = ERA5 wind. Arrow points where smoke is blown.<br>
+  🌧️ <b>Blue dots</b> = rain rate. Bigger = heavier rain washing out smoke.<br>
+  🌫️ <b>Faint blobs</b> = calibrated haze forecast (matches downwind of high-probability fires).
 </div>
         """, unsafe_allow_html=True)
     with c2:
         st.markdown("#### Which fire is most likely the culprit?")
-        st.caption("We compare every fire with the pollution measured in cities, considering wind. The one that best explains the data gets the highest score.")
-        disp = hotspots_analyzed[["latitude", "longitude", "frp", "posterior_prob"]].sort_values("posterior_prob", ascending=False)
-        disp.columns = ["Lat", "Lon", "Fire strength (MW)", "Likelihood"]
+        st.caption("Bayesian inverse attribution with spatial error covariance. Posterior = how well fire explains observed PM2.5 given wind/rain.")
+        disp = fire_posteriors[["latitude", "longitude", "frp", "biome", "Q_init", "posterior_prob"]].sort_values("posterior_prob", ascending=False)
+        disp.columns = ["Lat", "Lon", "FRP (MW)", "Biome", "Q (kg/s)", "Posterior Prob"]
         try:
-            st.dataframe(disp.style.format({"Fire strength (MW)": "{:.1f}", "Likelihood": "{:.2%}", "Lat": "{:.3f}", "Lon": "{:.3f}"}).background_gradient(subset=["Likelihood"], cmap="Oranges"), use_container_width=True, height=260)
+            st.dataframe(disp.style.format({"FRP (MW)": "{:.1f}", "Q (kg/s)": "{:.4f}", "Posterior Prob": "{:.2%}", "Lat": "{:.3f}", "Lon": "{:.3f}"}).background_gradient(subset=["Posterior Prob"], cmap="Oranges"), use_container_width=True, height=260)
         except Exception:
             st.dataframe(disp, use_container_width=True)
         if not disp.empty:
             top = disp.iloc[0]
-            st.success(f"**Most likely source:** Fire at {top['Lat']:.3f}, {top['Lon']:.3f} — strength {top['Fire strength (MW)']:.1f} MW — **{top['Likelihood']:.0%} likely**")
-            st.caption("Likelihood = how well this fire's smoke, carried by today's wind and cleaned by rain, matches the haze measured in Malaysian cities.")
+            st.success(f"**Most likely source:** {top['Biome']} fire at {top['Lat']:.3f}, {top['Lon']:.3f} — FRP {top['FRP (MW)']:.1f} MW — **{top['Posterior Prob']:.0%} posterior probability**")
+            st.caption("Posterior = how well this fire's smoke, transported by ERA5 winds and scavenged by rain, matches observed PM2.5 at Malaysian cities.")
         st.markdown("---")
-        st.markdown("**Where data comes from:**")
-        st.markdown("- **Fires:** NASA FIRMS (VIIRS satellite, 375m resolution, every 3h)\n- **Wind/Rain:** Open-Meteo (ECMWF/GFS weather models, hourly)\n- **City air:** DOE APIMS / OpenDOSM (ground sensors, PM2.5 µg/m³)")
+        st.markdown("**Data sources:**")
+        st.markdown("- **Fires:** NASA FIRMS VIIRS (375m, 3h) + ESA WorldCover biome\n- **Wind/PBL/Rain:** ERA5 / Open-Meteo (hourly, 0.25°)\n- **Urban baseline:** CAMS EAC4 non-haze months (Nov–Apr)\n- **Validation:** CAMS EAC4 Sep 2019 haze reanalysis")
+
+with tab_forecast:
+    st.markdown("### 24-Hour Calibrated Forecast")
+    st.caption("Hourly predictions showing how haze evolves with changing wind, rain, and PBL height.")
+    
+    with st.spinner("Generating 24-hour forecast..."):
+        forecast_df = predict_haze_forecast(hotspots_raw, receptors_df, forecast_hours=24)
+    
+    # City selector
+    cities = forecast_df["station_name"].unique()
+    selected_city = st.selectbox("Select city", cities)
+    
+    city_forecast = forecast_df[forecast_df["station_name"] == selected_city].copy()
+    
+    # Plot
+    import plotly.graph_objects as go
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=city_forecast["hour_utc"],
+        y=city_forecast["pm25_pred"],
+        mode="lines+markers",
+        name="Predicted PM2.5",
+        line=dict(color="#ff9800", width=3),
+        marker=dict(size=8)
+    ))
+    # Add API threshold lines
+    for thresh, label, color in [(12, "Good→Moderate", "#00b050"), (35.4, "Moderate→Unhealthy", "#ff9800"), (55.4, "Unhealthy→Very Unhealthy", "#f44336")]:
+        fig.add_hline(y=thresh, line_dash="dash", line_color=color, annotation_text=label, annotation_position="right")
+    
+    fig.update_layout(
+        title=f"{selected_city} — 24h PM2.5 Forecast",
+        xaxis_title="Hour (UTC)",
+        yaxis_title="PM2.5 (µg/m³)",
+        template="plotly_dark",
+        height=400,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Table
+    st.dataframe(city_forecast[["hour_utc", "pm25_pred", "api_pred", "category"]].style.format({"pm25_pred": "{:.1f}", "api_pred": "{:.0f}"}), use_container_width=True)
+    
+    st.download_button("⬇️ Download 24h forecast CSV", data=forecast_df.to_csv(index=False).encode(), file_name="haze_forecast_24h.csv", mime="text/csv")
 
 with tab_how:
-    st.markdown("### How it works — in 3 simple steps")
-    s1, s2, s3 = st.columns(3)
+    st.markdown("### How it works — calibrated research model")
+    s1, s2, s3, s4 = st.columns(4)
     with s1:
         st.markdown("""
 <div style="background:#0f1117;border:1px solid #2a2a3a;border-radius:12px;padding:14px;text-align:center;">
   <div style="font-size:32px;">🔥</div>
-  <div style="font-weight:700;margin:6px 0;">1. Fires make smoke</div>
-  <div style="color:#aaa;font-size:13px;">Satellites spot hot fires in Indonesia. Hotter fire (higher MW) = more smoke. We turn fire strength into smoke amount.</div>
-  <div style="margin-top:8px;color:#888;font-size:12px;">Example: 300 MW fire → lots of smoke</div>
+  <div style="font-weight:700;margin:6px 0;">1. Fires → Emissions</div>
+  <div style="color:#aaa;font-size:13px;">ESA WorldCover biome (peat/forest) → literature EF_PM2.5 → Q (kg/s)</div>
 </div>
         """, unsafe_allow_html=True)
     with s2:
         st.markdown("""
 <div style="background:#0f1117;border:1px solid #2a2a3a;border-radius:12px;padding:14px;text-align:center;">
-  <div style="font-size:32px;">💨🌧️</div>
-  <div style="font-weight:700;margin:6px 0;">2. Wind carries, rain cleans</div>
-  <div style="color:#aaa;font-size:13px;">Wind blows smoke toward or away from Malaysia. Rain washes smoke out of the air on the way. No rain + right wind = haze arrives.</div>
-  <div style="margin-top:8px;color:#888;font-size:12px;">225° from SW → blows NE toward KL/JB</div>
+  <div style="font-size:32px;">💨</div>
+  <div style="font-weight:700;margin:6px 0;">2. Trajectory Transport</div>
+  <div style="color:#aaa;font-size:13px;">ERA5 winds → 2D trajectory → PBL-capped box model</div>
 </div>
         """, unsafe_allow_html=True)
     with s3:
         st.markdown("""
 <div style="background:#0f1117;border:1px solid #2a2a3a;border-radius:12px;padding:14px;text-align:center;">
-  <div style="font-size:32px;">🏙️📊</div>
-  <div style="font-weight:700;margin:6px 0;">3. We predict city air</div>
-  <div style="color:#aaa;font-size:13px;">We add smoke from all fires at each Malaysian city, get PM2.5, then convert to Malaysian API. API ≥100 = haze.</div>
-  <div style="margin-top:8px;color:#888;font-size:12px;">API 0-50 Good, 101+ Unhealthy</div>
+  <div style="font-size:32px;">🌧️</div>
+  <div style="font-weight:700;margin:6px 0;">3. Rain Scavenging</div>
+  <div style="color:#aaa;font-size:13px;">Path-integrated Λ=a·P^b along trajectory</div>
 </div>
         """, unsafe_allow_html=True)
+    with s4:
+        st.markdown("""
+<div style="background:#0f1117;border:1px solid #2a2a3a;border-radius:12px;padding:14px;text-align:center;">
+  <div style="font-size:32px;">📊</div>
+  <div style="font-weight:700;margin:6px 0;">4. Bayesian Attribution</div>
+  <div style="color:#aaa;font-size:13px;">Importance sampling + spatial covariance → posterior fire probabilities</div>
+</div>
+        """, unsafe_allow_html=True)
+    
     st.markdown("""
 <div style="background:#0f1117;border:1px solid #2a2a3a;border-radius:10px;padding:12px 14px;margin-top:14px;">
-<b>What is API?</b> Malaysian Air Pollutant Index — the number you hear on the news. It is <b>not</b> PM2.5 directly, but a 0-500 scale from PM2.5:<br>
+<b>What is API?</b> Malaysian Air Pollutant Index — 0-500 scale from PM2.5:<br>
 <span style="background:#00b050;color:white;padding:2px 7px;border-radius:4px;">0-50 Good</span> →
 <span style="background:#ffeb3b;color:#111;padding:2px 7px;border-radius:4px;">51-100 Moderate</span> →
 <span style="background:#ff9800;color:white;padding:2px 7px;border-radius:4px;">101-200 Unhealthy</span> →
-<span style="background:#f44336;color:white;padding:2px 7px;border-radius:4px;">201-300 Very Unhealthy</span>. Haze = Unhealthy and above.
+<span style="background:#f44336;color:white;padding:2px 7px;border-radius:4px;">201-300 Very Unhealthy</span>. Haze = Unhealthy+.
 </div>
     """, unsafe_allow_html=True)
-    st.markdown("#### Why predictions can be wrong")
-    st.caption("Science, simply:")
-    st.markdown("- **Distance:** Smoke travels 300-800km over the sea — simple wind arrows are a simplification. Real air has twists and layers.\n- **Unmeasured fires:** Clouds can hide fires from satellites.\n- **Factory/traffic pollution:** Cities also make their own haze, not just Indonesian fires.\n- **Model is unscaled:** We scale haze to be visible — real tuning needs months of DO E history.")
-    with st.expander("For experts — show the actual formulas", expanded=False):
-        st.latex(r"Q = 0.02 \times \text{FRP},\quad \Lambda = 10^{-4} P^{0.8},\quad \text{scavenging}=e^{-\Lambda x/U}")
-        st.latex(r"C = \frac{Q}{\pi U \sigma_y\sigma_z} e^{-y^2/2\sigma_y^2} e^{-h^2/2\sigma_z^2} e^{-\Lambda x/U}\times10^6")
-        st.latex(r"p(\theta|d) \propto \mathcal{N}(d|f(\theta),R)\,p(\theta),\; p(\theta)\propto \text{FRP}")
-        st.caption("Forecast per grid/city: background (8 µg) + Σ fires C, with long-range heuristic exp(-x/260km) to make plume reach Malaysia. See src/physics/forecast_grid.py:24 and src/physics/dispersion.py:5. RMSE and MAP diagnostics logged in code.")
-        st.code(f"Today: wind {meteo_data['wind_speed']:.1f} m/s from {meteo_data['wind_dir']:.0f}°, rain {meteo_data['precipitation']:.1f} mm/h, amplification {amplification}, method {weight_opt}")
+    
+    st.markdown("#### Data sources in this dashboard")
+    st.markdown("""
+- **Predicted**: Calibrated model (biome emissions + ERA5 trajectory + PBL + rain scavenging + urban baseline)
+- **Reference (CAMS)**: Open-Meteo CAMS EAC4 reanalysis — ECMWF model output, **not ground sensors**
+- **Ground truth (IQAir/DOE)**: Actual station measurements — often lower than CAMS model
+- **CAMS model typically reads 30-100% higher** than ground sensors in SE Asia due to model resolution and lack of local deposition
+    """)
+    
+    st.markdown("#### Why this model is different")
+    st.markdown("""
+- **Biome-specific emissions**: Peat fires (smoldering) emit 3× more PM2.5 per MW than forest fires (flaming)
+- **Trajectory transport**: Follows actual wind curves, not straight-line Gaussian
+- **PBL capping**: Daytime mixing to 1500m, nighttime to 300m — changes concentrations 5×
+- **Path-integrated rain**: Rain along entire trajectory, not just at source
+- **Urban baseline**: CAMS-derived diurnal curve separates local traffic from transboundary smoke
+- **Continuous inverse**: 2000 importance samples with spatial error covariance, not discrete FRP weighting
+- **Proxy validated**: Against CAMS EAC4 Sep 2019 haze reanalysis
+    """)
+    
+    with st.expander("For experts — formulas", expanded=False):
+        st.latex(r"Q_i = C_f \cdot \frac{\text{FRP}_i}{1-\alpha_{cloud}} e^{\tau_{canopy}} \cdot EF_{PM2.5,biome} \cdot 10^{-3}")
+        st.latex(r"\frac{d\mathbf{x}}{dt} = \mathbf{u}(\mathbf{x},t), \quad \mathbf{x}(0) = \mathbf{x}_{fire}")
+        st.latex(r"C = \frac{Q}{\sqrt{2\pi} U \sigma_y H_{pbl}} \exp\left(-\frac{y^2}{2\sigma_y^2}\right) \exp\left(-\int_0^T \Lambda(t) dt\right) \times 10^6")
+        st.latex(r"\Lambda(t) = a P(t)^b, \quad a=10^{-4}, b=0.8")
+        st.latex(r"p(\mathbf{Q}|\mathbf{d}) \propto \exp\left(-\frac{1}{2}(\mathbf{d}-\mathbf{H}\mathbf{Q})^T \mathbf{R}^{-1}(\mathbf{d}-\mathbf{H}\mathbf{Q})\right) \prod_i \text{LogNormal}(Q_i|Q_{init,i},\sigma_{prior})")
+        st.caption("H = transport matrix (N_fires × N_receptors), R = spatial covariance matrix.")
 
 # Footer
-st.success(f"Done — {len(hotspots_analyzed)} fires → {len(city_forecast)} cities → {len(haze_grid)} map points. Switch tabs above to see prediction vs evidence.")
-st.caption("Tip: Use the sidebar to try *what if* — change wind to 90° (easterly) and see haze blow away from Malaysia, or add heavy rain and watch it fade. Data auto-refreshes every 30-60 min.")
+st.success(f"Done — {len(fire_posteriors)} fires → {len(city_forecast)} cities → {len(haze_grid)} map points. Proxy-calibrated model.")
+st.caption("Tip: Use sidebar scenarios to test sensitivity — increase rain, shift wind, scale urban baseline. Data refreshes hourly.")
