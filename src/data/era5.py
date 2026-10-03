@@ -241,12 +241,15 @@ def get_meteo_interpolators(df: pd.DataFrame) -> dict:
         pr_arr[i, j, k] = row["precipitation"]
         pbl_arr[i, j, k] = row["pbl_height"]
     
-    # Fill NaN with nearest valid
+    # Fill NaN with nearest valid using interpolation
     for arr in [u_arr, v_arr, pr_arr, pbl_arr]:
         mask = np.isnan(arr)
         if mask.any():
+            # Replace NaN with 0 for filtering, then restore interpolated values
+            arr_filled = np.where(mask, 0, arr)
             from scipy.ndimage import gaussian_filter
-            arr[mask] = gaussian_filter(arr, sigma=1)[mask]
+            arr_smooth = gaussian_filter(arr_filled, sigma=1)
+            arr[mask] = arr_smooth[mask]
     
     # Create interpolators
     points = (lats, lons, np.arange(n_hours))

@@ -108,10 +108,20 @@ def get_biome(lat: float, lon: float, use_cache: bool = True) -> str:
     return biome
 
 
-def add_biome_column(df: pd.DataFrame, lat_col: str = "latitude", lon_col: str = "longitude") -> pd.DataFrame:
-    """Add 'biome' column to FIRMS hotspot DataFrame."""
+def add_biome_column(df: pd.DataFrame, lat_col: str = "latitude", lon_col: str = "longitude", fast_mode: bool = False) -> pd.DataFrame:
+    """Add 'biome' column to FIRMS hotspot DataFrame.
+    
+    Args:
+        df: DataFrame with lat/lon columns
+        lat_col: latitude column name
+        lon_col: longitude column name
+        fast_mode: If True, use heuristic only (no WMS calls) - much faster for large datasets
+    """
     df = df.copy()
-    df["biome"] = df.apply(lambda r: get_biome(r[lat_col], r[lon_col]), axis=1)
+    if fast_mode:
+        df["biome"] = df.apply(lambda r: _heuristic_biome(r[lat_col], r[lon_col]), axis=1)
+    else:
+        df["biome"] = df.apply(lambda r: get_biome(r[lat_col], r[lon_col]), axis=1)
     return df
 
 

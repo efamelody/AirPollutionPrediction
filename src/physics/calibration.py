@@ -315,7 +315,7 @@ def run_inverse_importance_sampling(
     
     # Forward model: C_pred = C_unit @ Q  (N_receptors,)
     # Vectorized: (n_samples, N_receptors)
-    C_pred = Q_samples @ C_unit.T
+    C_pred = Q_samples @ C_unit
     
     # Observed data
     d_obs = obs_pm25

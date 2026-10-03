@@ -6,9 +6,10 @@ from datetime import datetime, timezone
 from src.config import METEO_LAT, METEO_LON
 from src.data.firms import fetch_firms_hotspots
 from src.data.meteo_grid import fetch_meteo_grid, get_meteo_for_transport, get_centroid_meteo
-from src.data.receptors import fetch_malaysia_receptors
+from src.data.receptors import fetch_malaysia_receptors, fetch_combined_receptors
 from src.physics.api import pm25_to_api, api_category
 from src.physics.research_model import predict_haze, predict_haze_forecast
+from src.physics.calibration import compute_validation_metrics
 
 # ------------------------------------------------------------------------------
 # PAGE CONFIG — plain language
@@ -51,8 +52,10 @@ default_key = "DEMO_KEY"
 try:
     if "FIRMS_MAP_KEY" in st.secrets:
         default_key = st.secrets["FIRMS_MAP_KEY"]
-except Exception:
-    pass
+        # Debug: show first 8 chars of key
+        st.sidebar.caption(f"Using FIRMS key from secrets: {default_key[:8]}...")
+except Exception as e:
+    st.sidebar.caption(f"Could not load FIRMS key from secrets: {e}")
 
 st.sidebar.markdown("**Fires:** Using demo fires in Sumatra & Kalimantan. Add your NASA key to see live satellite fires.")
 firms_api_key = st.sidebar.text_input("NASA FIRMS key (leave DEMO_KEY for demo)", value=default_key, type="password", help="Free at firms.modaps.eosdis.nasa.gov")
@@ -115,9 +118,37 @@ def cached_meteo_grid(n_lat: int = 8, n_lon: int = 12, forecast_hours: int = 24)
 
 # Fetch data
 use_live_air = st.sidebar.checkbox("Use live air quality (Open-Meteo CAMS)", value=True, help="When ON: city 'Measured now' is real current PM2.5 from Open-Meteo. When OFF: shows mock haze-event to demo a heavy haze day.")
-receptors_df = fetch_malaysia_receptors(live=use_live_air)
+
+# WAQI token
+try:
+    waqi_token = st.secrets.get("WAQI_API_TOKEN", "")
+except Exception:
+    waqi_token = ""
+
+# Validation source selector
+validation_source = st.sidebar.radio(
+    "Validation data",
+    ["CAMS (model)", "WAQI (ground)", "Both"],
+    index=2,
+    help="CAMS = ECMWF model reanalysis. WAQI = Malaysia DOE ground stations via waqi.info"
+)
+
+# Target hour for validation: model predicts for (start_hour + forecast_hours - 1) % 24
+start_hour_utc = datetime.now(timezone.utc).hour
+forecast_hours = 24
+target_hour_utc = (start_hour_utc + forecast_hours - 1) % 24
+
+receptors_df = fetch_combined_receptors(
+    cams_live=use_live_air,
+    waqi_token=waqi_token if waqi_token else None,
+    target_hour_utc=target_hour_utc
+)
 if not receptors_df.empty and "pm25_source" in receptors_df.columns:
-    st.sidebar.caption(f"City air source: {receptors_df['pm25_source'].iloc[0]}")
+    source_info = receptors_df['pm25_source'].iloc[0]
+    if "pm25_waqi" in receptors_df.columns:
+        waqi_count = receptors_df["pm25_waqi"].notna().sum()
+        source_info += f" + WAQI ({waqi_count}/5 stations)"
+    st.sidebar.caption(f"City air: {source_info} (hour {target_hour_utc}:00 UTC)")
 
 hotspots_raw = cached_hotspots(firms_api_key, selected_days)
 
@@ -165,16 +196,39 @@ with k3:
 # Validation metrics badge
 if metrics:
     st.sidebar.markdown("---")
-    st.sidebar.markdown("**Proxy Validation (vs CAMS):**")
+    
+    # CAMS validation (from model)
+    st.sidebar.markdown("**Proxy Validation (vs CAMS model):**")
     st.sidebar.metric("RMSE", f"{metrics.get('RMSE', 0):.1f} µg/m³")
     st.sidebar.metric("NMB", f"{metrics.get('NMB', 0):.1f}%")
     st.sidebar.metric("R", f"{metrics.get('R', 0):.2f}")
+    
+    # WAQI validation (ground truth) - compute if WAQI data available
+    if "pm25_waqi" in receptors_df.columns and receptors_df["pm25_waqi"].notna().any():
+        pred_pm25 = city_forecast["pm25_pred"].values
+        waqi_obs = []
+        for _, r in city_forecast.iterrows():
+            city = r["station_name"]
+            waqi_val = receptors_df.loc[receptors_df["station_name"] == city, "pm25_waqi"].values
+            if len(waqi_val) > 0 and not pd.isna(waqi_val[0]):
+                waqi_obs.append(float(waqi_val[0]))
+            else:
+                waqi_obs.append(np.nan)
+        waqi_obs = np.array(waqi_obs)
+        valid = ~np.isnan(waqi_obs)
+        if valid.sum() >= 3:
+            waqi_metrics = compute_validation_metrics(pred_pm25[valid], waqi_obs[valid])
+            st.sidebar.markdown("**Ground-Truth Validation (vs WAQI stations):**")
+            st.sidebar.metric("RMSE", f"{waqi_metrics.get('RMSE', 0):.1f} µg/m³")
+            st.sidebar.metric("NMB", f"{waqi_metrics.get('NMB', 0):.1f}%")
+            st.sidebar.metric("R", f"{waqi_metrics.get('R', 0):.2f}")
+            st.sidebar.caption(f"Based on {valid.sum()}/5 stations")
 
 # ------------------------------------------------------------------------------
 # CITY CARDS — prediction vs truth, plain language
 # ------------------------------------------------------------------------------
 st.markdown("## 🏙️ Will it be hazy? — City by city")
-st.caption("**Top = calibrated prediction** (biome emissions + trajectory transport + urban baseline). **Bottom = CAMS model** (Open-Meteo ECMWF/CAMS reanalysis, not ground sensors). Model often reads higher than IQAir/DOE ground measurements. Mismatch = local pollution or wind blowing smoke away.")
+st.caption("**Top = calibrated prediction** (fire smoke only). **Middle = CAMS model** (ECMWF reanalysis). **Bottom = WAQI ground stations** (Malaysia DOE). Model predicts fire smoke; CAMS/WAQI include local pollution.")
 
 mismatch = 0
 if not city_forecast.empty:
@@ -190,32 +244,65 @@ cols = st.columns(len(city_forecast))
 for col, (_, row) in zip(cols, city_forecast.iterrows()):
     api = int(row["api_pred"])
     cat, color = api_category(api)
-    obs = float(row["pm25_obs"])
-    obs_api = pm25_to_api(obs)
-    obs_cat, obs_color = api_category(obs_api)
+    
+    # CAMS observation
+    cams_obs = float(row["pm25_obs"])
+    cams_api = pm25_to_api(cams_obs)
+    cams_cat, cams_color = api_category(cams_api)
+    if cams_api >= 201: cams_advice = "🔴 Hazardous — stay indoors"
+    elif cams_api >= 101: cams_advice = "🟠 Unhealthy — limit outdoor"
+    elif cams_api >= 51: cams_advice = "🟡 Moderate — sensitive groups care"
+    else: cams_advice = "🟢 Good air now"
+    
+    # WAQI observation (ground truth)
+    city_name = row['station_name']
+    waqi_obs = None
+    if "pm25_waqi" in receptors_df.columns:
+        waqi_val = receptors_df.loc[receptors_df["station_name"] == city_name, "pm25_waqi"].values
+        if len(waqi_val) > 0 and not pd.isna(waqi_val[0]):
+            waqi_obs = float(waqi_val[0])
+    
+    if waqi_obs is not None:
+        waqi_api = pm25_to_api(waqi_obs)
+        waqi_cat, waqi_color = api_category(waqi_api)
+        if waqi_api >= 201: waqi_advice = "🔴 Hazardous — stay indoors"
+        elif waqi_api >= 101: waqi_advice = "🟠 Unhealthy — limit outdoor"
+        elif waqi_api >= 51: waqi_advice = "🟡 Moderate — sensitive groups care"
+        else: waqi_advice = "🟢 Good air now"
+    
     if api >= 201: pred_advice, pred_face = "🔴 Fire smoke: Stay indoors", "😷"
     elif api >= 101: pred_advice, pred_face = "🟠 Fire smoke: Limit outdoor", "😶‍🌫️"
     elif api >= 51: pred_advice, pred_face = "🟡 Some fire haze", "🙂"
     else: pred_advice, pred_face = "🟢 No fire haze coming", "😊"
-    if obs_api >= 201: meas_advice = "🔴 Actually: Hazardous — stay indoors"
-    elif obs_api >= 101: meas_advice = "🟠 Actually: Unhealthy — limit outdoor"
-    elif obs_api >= 51: meas_advice = "🟡 Actually: Moderate — sensitive groups care"
-    else: meas_advice = "🟢 Actually: Good air now"
+    
     with col:
+        # Build WAQI section if available
+        waqi_section = ""
+        if waqi_obs is not None:
+            waqi_section = f"""
+    <div style="margin-top:8px;padding-top:8px;border-top:1px solid #2a2a3a;">
+      <div style="font-size:11px;color:#888;">WAQI GROUND STATION (DOE)</div>
+      <div style="font-size:14px;font-weight:700;color:{waqi_color};">API {waqi_api} — {waqi_cat} <span style="font-weight:400;color:#aaa;">({waqi_obs:.1f} µg/m³)</span></div>
+      <div style="font-size:11px;color:{waqi_color};margin-top:2px;">{waqi_advice}</div>
+      <div style="font-size:10px;color:#888;margin-top:4px;">Ground measurement from Malaysia DOE station.</div>
+    </div>
+"""
+        
         st.markdown(f"""
 <div style="padding:12px;border-radius:12px;border:2px solid {color};background:#0f1117;text-align:center;">
-  <div style="font-weight:700;font-size:15px;">{row['station_name']}</div>
+  <div style="font-weight:700;font-size:15px;">{city_name}</div>
   <div style="font-size:26px;margin:4px 0;">{pred_face}</div>
-  <div style="font-size:11px;color:#888;letter-spacing:0.5px;">PREDICTED (calibrated)</div>
+  <div style="font-size:11px;color:#888;letter-spacing:0.5px;">PREDICTED (fire smoke only)</div>
   <div style="font-size:20px;font-weight:800;color:{color};">API {api} — {cat}</div>
   <div style="font-size:11px;color:#ccc;">PM2.5 {row['pm25_pred']:.1f} µg/m³</div>
   <div style="font-size:11px;color:{color};margin-top:4px;font-weight:600;">{pred_advice}</div>
   <div style="margin-top:8px;padding-top:8px;border-top:1px solid #2a2a3a;">
-    <div style="font-size:11px;color:#888;">CAMS MODEL (Open-Meteo)</div>
-    <div style="font-size:14px;font-weight:700;color:{obs_color};">API {obs_api} — {obs_cat} <span style="font-weight:400;color:#aaa;">({obs:.1f} µg/m³)</span></div>
-    <div style="font-size:11px;color:{obs_color};margin-top:2px;">{meas_advice}</div>
-    <div style="font-size:10px;color:#888;margin-top:4px;">Note: CAMS model ≠ ground sensors (IQAir/DOE). Model often higher.</div>
+    <div style="font-size:11px;color:#888;">CAMS MODEL (Open-Meteo ECMWF)</div>
+    <div style="font-size:14px;font-weight:700;color:{cams_color};">API {cams_api} — {cams_cat} <span style="font-weight:400;color:#aaa;">({cams_obs:.1f} µg/m³)</span></div>
+    <div style="font-size:11px;color:{cams_color};margin-top:2px;">{cams_advice}</div>
+    <div style="font-size:10px;color:#888;margin-top:4px;">Model reanalysis ≠ ground sensors. Often higher.</div>
   </div>
+{waqi_section}
 </div>
         """, unsafe_allow_html=True)
 
@@ -322,6 +409,18 @@ with tab_forecast:
     with st.spinner("Generating 24-hour forecast..."):
         forecast_df = predict_haze_forecast(hotspots_raw, receptors_df, forecast_hours=24)
     
+    # Fetch WAQI forecast if token available
+    waqi_forecast_data = None
+    if waqi_token:
+        from src.data.waqi import fetch_waqi_forecast, STATION_UIDS
+        selected_city = None  # will be set by selectbox
+        # We'll fetch for all cities and use the selected one
+        waqi_forecasts = {}
+        for city, uid in STATION_UIDS.items():
+            fc = fetch_waqi_forecast(uid, waqi_token)
+            if fc:
+                waqi_forecasts[city] = fc
+    
     # City selector
     cities = forecast_df["station_name"].unique()
     selected_city = st.selectbox("Select city", cities)
@@ -335,10 +434,28 @@ with tab_forecast:
         x=city_forecast["hour_utc"],
         y=city_forecast["pm25_pred"],
         mode="lines+markers",
-        name="Predicted PM2.5",
+        name="Model Predicted PM2.5",
         line=dict(color="#ff9800", width=3),
         marker=dict(size=8)
     ))
+    
+    # Add WAQI forecast if available
+    if waqi_token and selected_city in waqi_forecasts:
+        waqi_fc = waqi_forecasts[selected_city]
+        # WAQI forecast is daily averages - convert to hourly for plotting
+        # For now, show as daily markers
+        days = [d["day"] for d in waqi_fc]
+        avg_vals = [d["avg"] for d in waqi_fc]
+        # Convert day strings to hour positions (assume mid-day)
+        day_hours = [i * 24 + 12 for i in range(len(days))]  # rough mapping
+        fig.add_trace(go.Scatter(
+            x=day_hours,
+            y=avg_vals,
+            mode="markers",
+            name="WAQI Forecast (daily avg)",
+            marker=dict(color="#00b050", size=12, symbol="diamond"),
+        ))
+    
     # Add API threshold lines
     for thresh, label, color in [(12, "Good→Moderate", "#00b050"), (35.4, "Moderate→Unhealthy", "#ff9800"), (55.4, "Unhealthy→Very Unhealthy", "#f44336")]:
         fig.add_hline(y=thresh, line_dash="dash", line_color=color, annotation_text=label, annotation_position="right")
@@ -354,6 +471,15 @@ with tab_forecast:
     
     # Table
     st.dataframe(city_forecast[["hour_utc", "pm25_pred", "api_pred", "category"]].style.format({"pm25_pred": "{:.1f}", "api_pred": "{:.0f}"}), use_container_width=True)
+    
+    # WAQI forecast table
+    if waqi_token and selected_city in waqi_forecasts:
+        st.markdown("#### WAQI Forecast (Daily Average PM2.5)")
+        waqi_fc = waqi_forecasts[selected_city]
+        waqi_df = pd.DataFrame(waqi_fc)
+        waqi_df["API"] = waqi_df["avg"].apply(pm25_to_api)
+        waqi_df["Category"] = waqi_df["API"].apply(lambda x: api_category(x)[0])
+        st.dataframe(waqi_df[["day", "avg", "min", "max", "API", "Category"]].style.format({"avg": "{:.0f}", "min": "{:.0f}", "max": "{:.0f}", "API": "{:.0f}"}), use_container_width=True)
     
     st.download_button("⬇️ Download 24h forecast CSV", data=forecast_df.to_csv(index=False).encode(), file_name="haze_forecast_24h.csv", mime="text/csv")
 
@@ -433,3 +559,13 @@ with tab_how:
 # Footer
 st.success(f"Done — {len(fire_posteriors)} fires → {len(city_forecast)} cities → {len(haze_grid)} map points. Proxy-calibrated model.")
 st.caption("Tip: Use sidebar scenarios to test sensitivity — increase rain, shift wind, scale urban baseline. Data refreshes hourly.")
+
+# WAQI Attribution (required by terms)
+st.caption("""
+**Air quality data sources:** 
+- Fire hotspots: NASA FIRMS
+- Meteorology: Open-Meteo ERA5
+- Model validation (CAMS): Open-Meteo CAMS EAC4 reanalysis
+- **Ground stations (WAQI):** World Air Quality Index Project (waqi.info) & Malaysia Department of Environment (DOE)
+Attribution required per WAQI terms of use.
+""")
